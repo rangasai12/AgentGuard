@@ -17,9 +17,10 @@ across every agent a company runs, across multiple companies.
   the Live Feed master-detail view, and the Pending Approvals queue.
 -->
 
-![Overview dashboard](docs/screenshots/overview.png)
 ![Live Feed](docs/screenshots/live-feed.png)
-![Pending Approvals](docs/screenshots/pending-approvals.png)
+![Overview dashboard](docs/screenshots/overview.png)
+
+
 
 ## Why
 
