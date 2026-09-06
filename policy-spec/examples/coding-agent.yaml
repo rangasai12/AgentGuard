@@ -1,0 +1,50 @@
+# Example policy for a coding agent scoped to a single project workspace.
+version: 1
+name: coding-agent-policy
+
+filesystem:
+  - allow: read_write
+    paths: ["/workspace/**"]
+  - deny: write
+    paths: ["**"]
+    reason: "writes outside /workspace are never allowed"
+
+network:
+  default: deny
+  allow:
+    - domain: "api.github.com"
+      methods: ["GET", "POST"]
+    - domain: "*.githubusercontent.com"
+      methods: ["GET"]
+    - domain: "api.anthropic.com"
+      methods: ["POST"]
+  deny:
+    - ip_literal: true
+      reason: "no direct-IP network calls (common SSRF/exfil pattern)"
+
+shell:
+  default: deny
+  allow:
+    - pattern: "git *"
+    - pattern: "npm test*"
+    - pattern: "npm run build*"
+    - pattern: "go test*"
+  deny:
+    - pattern: "rm -rf *"
+      require_approval: true
+      reason: "destructive delete — confirm before allowing"
+    - pattern: "curl * | sh*"
+      reason: "no pipe-to-shell installs"
+    - pattern: "curl * | bash*"
+      reason: "no pipe-to-shell installs"
+
+secrets:
+  deny:
+    - env_var: "AWS_SECRET_ACCESS_KEY"
+      reason: "agents never read cloud credentials directly"
+    - env_var: "ANTHROPIC_API_KEY"
+      reason: "the runtime injects this itself; the agent should not read or exfiltrate it"
+
+escalation:
+  approval_timeout_seconds: 300
+  on_timeout: deny

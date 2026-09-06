@@ -1,0 +1,87 @@
+# Demo policy for a dev-scoped coding agent: it may read/write freely inside
+# workspace/, may not touch workspace/prod/, may only reach a dev API domain
+# (never a prod host or a raw IP), may run tests/builds but not destructive
+# or pipe-to-shell commands, may never read production credentials, and may
+# scale a service up a little on its own but not a lot without a human.
+#
+# Paths are relative to this example's own directory (see tools.py), matched
+# by AgentGuard as plain strings after path.Clean — so this works unchanged
+# regardless of where the repo is checked out.
+version: 1
+name: openai-coding-agent-demo
+
+# Tool calls are name-gated here (all allowed) purely to demonstrate the
+# mcp_tool layer (Guard.check_and_execute, used by the OpenAI adapter); the
+# real, resource-aware enforcement is the filesystem/network/shell/secrets/
+# functions sections below, checked separately inside each tool via
+# @guard.checked(...)/@guard.function() — see tools.py.
+mcp:
+  default: deny
+  servers:
+    - name: "local-tools"
+      default: allow
+
+filesystem:
+  - deny: write
+    paths: ["workspace/prod/**"]
+    reason: "production config is never writable by the agent, even though it's nested under the workspace"
+  - allow: read_write
+    paths: ["workspace/**"]
+  - deny: write
+    paths: ["**"]
+    reason: "writes outside workspace/ are never allowed"
+
+network:
+  default: deny
+  allow:
+    - domain: "api.github.com"
+      methods: ["GET"]
+      reason: "dev-only: reading public repo data"
+  deny:
+    - domain: "deploy.prod.internal"
+      reason: "no path to the production deploy endpoint from this agent"
+    - ip_literal: true
+      reason: "no direct-IP network calls (common SSRF/exfil pattern)"
+
+shell:
+  default: deny
+  allow:
+    - pattern: "git *"
+    - pattern: "npm test*"
+    - pattern: "npm run build*"
+  deny:
+    - pattern: "rm -rf *"
+      require_approval: true
+      reason: "destructive delete — confirm before allowing"
+    - pattern: "curl * | sh*"
+      reason: "no pipe-to-shell installs, however the call is disguised"
+    - pattern: "curl * | bash*"
+      reason: "no pipe-to-shell installs, however the call is disguised"
+
+functions:
+  default: deny
+  rules:
+    - name: "scale_service"
+      conditions:
+        - arg: "replicas"
+          op: "<="
+          value: 5
+      allow: true
+    - name: "scale_service"
+      conditions:
+        - arg: "replicas"
+          op: ">"
+          value: 5
+      require_approval: true
+      reason: "scaling beyond 5 replicas needs a human sign-off"
+
+secrets:
+  deny:
+    - env_var: "PROD_DEPLOY_TOKEN"
+      reason: "the agent never authenticates to production directly"
+    - env_var: "AWS_SECRET_ACCESS_KEY"
+      reason: "agents never read cloud credentials directly"
+
+escalation:
+  approval_timeout_seconds: 20
+  on_timeout: deny

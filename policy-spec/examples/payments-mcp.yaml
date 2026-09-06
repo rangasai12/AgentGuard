@@ -1,0 +1,25 @@
+# Example policy locking down a payments MCP server so read-only tools work
+# freely, refunds are blocked outright, and charges require human approval.
+version: 1
+name: payments-mcp-policy
+
+mcp:
+  default: deny
+  servers:
+    - name: "payments-mcp"
+      default: deny
+      tools:
+        - name: "list_transactions"
+          allow: true
+        - name: "get_customer"
+          allow: true
+        - name: "charge_customer"
+          require_approval: true
+          reason: "money movement always requires a human in the loop"
+        - name: "refund_customer"
+          deny: true
+          reason: "refunds are handled through the support console, never by an agent"
+
+escalation:
+  approval_timeout_seconds: 120
+  on_timeout: deny

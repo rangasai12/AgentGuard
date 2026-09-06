@@ -1,0 +1,30 @@
+# Example policy for the `functions` section: argument-aware rules for named
+# calls, instead of the all-or-nothing per-name gating `mcp` gives you.
+version: 1
+name: billing-functions-policy
+
+functions:
+  default: deny
+  rules:
+    - name: "charge_customer"
+      conditions:
+        - arg: "amount"
+          op: "<"
+          value: 1000
+      allow: true
+    - name: "charge_customer"
+      conditions:
+        - arg: "amount"
+          op: ">="
+          value: 1000
+      require_approval: true
+      reason: "large charges need a human"
+    - name: "transfer_funds"
+      conditions:
+        - arg: "currency"
+          op: "!="
+          value: "USD"
+      deny: true
+      reason: "only USD transfers are supported"
+    - name: "list_transactions"
+      allow: true

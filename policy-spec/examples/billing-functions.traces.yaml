@@ -1,0 +1,50 @@
+# Example trace file for `agentctl policy test`, exercising
+# billing-functions.yaml. Run with:
+#   agentctl policy test billing-functions.yaml billing-functions.traces.yaml
+version: 1
+cases:
+  - name: "small charge is allowed"
+    action:
+      type: function
+      name: charge_customer
+      args:
+        amount: 500
+    want: allow
+
+  - name: "large charge requires approval"
+    action:
+      type: function
+      name: charge_customer
+      args:
+        amount: 5000
+    want: require_approval
+
+  - name: "boundary amount uses the >= rule"
+    action:
+      type: function
+      name: charge_customer
+      args:
+        amount: 1000
+    want: require_approval
+
+  - name: "non-USD transfer is denied"
+    action:
+      type: function
+      name: transfer_funds
+      args:
+        currency: EUR
+    want: deny
+
+  - name: "listing transactions is allowed regardless of arguments"
+    action:
+      type: function
+      name: list_transactions
+      args:
+        limit: 50
+    want: allow
+
+  - name: "unknown function is denied by policy default"
+    action:
+      type: function
+      name: delete_everything
+    want: deny

@@ -1,0 +1,335 @@
+package mcp
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"agentguard/approval"
+	"agentguard/daemon"
+	"agentguard/engine"
+)
+
+const proxyTestPolicy = `
+version: 1
+mcp:
+  default: deny
+  servers:
+    - name: payments-mcp
+      default: deny
+      tools:
+        - name: list_transactions
+          allow: true
+        - name: charge_customer
+          require_approval: true
+        - name: refund_customer
+          deny: true
+          reason: "refunds go through support"
+`
+
+func newTestProxy(t *testing.T, approve approval.Func) (*Proxy, *daemon.AuditLogger) {
+	t.Helper()
+	policy, err := engine.ParsePolicy([]byte(proxyTestPolicy))
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	audit, err := daemon.NewAuditLogger(filepath.Join(t.TempDir(), "audit.log"))
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	t.Cleanup(func() { _ = audit.Close() })
+	return &Proxy{Policy: policy, Audit: audit, ServerName: "payments-mcp", Actor: "test-agent", Approve: approve}, audit
+}
+
+// harness wires a Proxy between an in-memory "client" and a hand-rolled
+// in-memory "server" (a goroutine reading requests and writing canned
+// responses), so the real line-protocol parsing/forwarding/interception logic
+// runs exactly as it would against a real subprocess, without spawning one.
+type harness struct {
+	clientToProxyW io.WriteCloser // test writes client requests here
+	proxyToClientR io.ReadCloser  // test reads what the proxy sent the client from here
+	done           chan error
+}
+
+func startHarness(t *testing.T, p *Proxy, serverHandler func(req rpcMessage) (resp any, forwardOK bool)) *harness {
+	t.Helper()
+
+	clientToProxyR, clientToProxyW := io.Pipe()
+	proxyToClientR, proxyToClientW := io.Pipe()
+	proxyToServerR, proxyToServerW := io.Pipe()
+	serverToProxyR, serverToProxyW := io.Pipe()
+
+	// Fake "server": reads one JSON-RPC line at a time, hands it to
+	// serverHandler, and writes back the response if forwardOK is true (a
+	// real server would never see a denied call at all, but callers use
+	// forwardOK=false to assert that).
+	go func() {
+		scanner := bufio.NewScanner(proxyToServerR)
+		scanner.Buffer(make([]byte, 4096), maxLineBytes)
+		for scanner.Scan() {
+			var req rpcMessage
+			_ = json.Unmarshal(scanner.Bytes(), &req)
+			resp, ok := serverHandler(req)
+			if !ok || resp == nil {
+				continue
+			}
+			data, _ := json.Marshal(resp)
+			_, _ = serverToProxyW.Write(append(data, '\n'))
+		}
+	}()
+
+	h := &harness{clientToProxyW: clientToProxyW, proxyToClientR: proxyToClientR, done: make(chan error, 1)}
+	go func() {
+		h.done <- p.run(context.Background(), clientToProxyR, proxyToClientW, serverToProxyR, proxyToServerW)
+	}()
+	return h
+}
+
+func (h *harness) sendClient(t *testing.T, msg any) {
+	t.Helper()
+	data, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if _, err := h.clientToProxyW.Write(append(data, '\n')); err != nil {
+		t.Fatalf("write client request: %v", err)
+	}
+}
+
+func (h *harness) readClientResponse(t *testing.T) map[string]any {
+	t.Helper()
+	sc := bufio.NewScanner(h.proxyToClientR)
+	sc.Buffer(make([]byte, 4096), maxLineBytes)
+	done := make(chan bool, 1)
+	go func() { done <- sc.Scan() }()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatalf("no response reached the client (scanner err: %v)", sc.Err())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for a response to reach the client")
+	}
+	var out map[string]any
+	if err := json.Unmarshal(sc.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal client response: %v", err)
+	}
+	return out
+}
+
+func toolCallRequest(id, tool string) map[string]any {
+	return map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  "tools/call",
+		"params":  map[string]any{"name": tool, "arguments": map[string]any{}},
+	}
+}
+
+func TestProxyForwardsAllowedToolCall(t *testing.T) {
+	p, audit := newTestProxy(t, nil)
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"ok": true}}, true
+	})
+
+	h.sendClient(t, toolCallRequest("1", "list_transactions"))
+	resp := h.readClientResponse(t)
+	if _, isError := resp["error"]; isError {
+		t.Fatalf("expected the allowed call to be forwarded and succeed, got %+v", resp)
+	}
+	events := audit.Tail(10)
+	if len(events) != 1 || events[0].Decision != engine.Allow {
+		t.Errorf("expected one Allow audit event, got %+v", events)
+	}
+}
+
+func TestProxyBlocksDeniedToolCallWithoutReachingServer(t *testing.T) {
+	p, audit := newTestProxy(t, nil)
+	serverSawCall := false
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		if req.Method == "tools/call" {
+			serverSawCall = true
+		}
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"ok": true}}, true
+	})
+
+	h.sendClient(t, toolCallRequest("2", "refund_customer"))
+	resp := h.readClientResponse(t)
+	errObj, isError := resp["error"].(map[string]any)
+	if !isError {
+		t.Fatalf("expected a denied tool call to get an error response, got %+v", resp)
+	}
+	if msg, _ := errObj["message"].(string); msg == "" {
+		t.Error("expected a non-empty error message")
+	}
+	if serverSawCall {
+		t.Error("denied tool call must never reach the real server")
+	}
+
+	events := audit.Tail(10)
+	if len(events) != 1 || events[0].Decision != engine.Deny {
+		t.Errorf("expected one Deny audit event, got %+v", events)
+	}
+}
+
+func TestProxyRequiresApprovalAndHonorsApproveFunc(t *testing.T) {
+	p, audit := newTestProxy(t, func(action engine.Action, decision engine.Decision, timeout time.Duration) engine.Result {
+		if action.Tool != "charge_customer" {
+			t.Errorf("unexpected tool requiring approval: %s", action.Tool)
+		}
+		return engine.Allow
+	})
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"ok": true}}, true
+	})
+
+	h.sendClient(t, toolCallRequest("3", "charge_customer"))
+	resp := h.readClientResponse(t)
+	if _, isError := resp["error"]; isError {
+		t.Fatalf("expected the human-approved charge to be forwarded, got %+v", resp)
+	}
+	events := audit.Tail(10)
+	if len(events) != 1 || events[0].Decision != engine.Allow {
+		t.Errorf("expected the audit log to record the approved decision, not the initial require_approval, got %+v", events)
+	}
+}
+
+func TestProxyApproveFuncNilFallsBackToOnTimeoutDeny(t *testing.T) {
+	// No Approve func at all (as if launched with no TTY, matching PromptTTY's
+	// "" return) and the policy has no explicit escalation.on_timeout, so it
+	// must fail closed (default Deny) rather than accidentally forwarding.
+	p, audit := newTestProxy(t, nil)
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"ok": true}}, true
+	})
+
+	h.sendClient(t, toolCallRequest("4", "charge_customer"))
+	resp := h.readClientResponse(t)
+	if _, isError := resp["error"]; !isError {
+		t.Fatalf("expected no-approval-available to fail closed (deny), got %+v", resp)
+	}
+	events := audit.Tail(10)
+	if len(events) != 1 || events[0].Decision != engine.Deny {
+		t.Errorf("expected a Deny audit event, got %+v", events)
+	}
+}
+
+func TestProxyClosesServerStdinWhenClientInputEnds(t *testing.T) {
+	// Regression test for a real deadlock found in manual testing: a real
+	// subprocess blocked reading its own stdin never sees EOF unless the
+	// proxy closes its write-end of the server's stdin pipe once the
+	// client's input stream ends. A pipe-based harness like the other tests
+	// here doesn't surface this because nothing downstream cares whether the
+	// pipe is closed — so this test asserts on serverIn.Close() directly.
+	p, _ := newTestProxy(t, nil)
+
+	clientToProxyR, clientToProxyW := io.Pipe()
+	proxyToServerR, proxyToServerW := io.Pipe()
+	serverToProxyR, _ := io.Pipe()
+
+	closed := make(chan struct{})
+	sw := &closeTrackingWriteCloser{WriteCloser: proxyToServerW, onClose: func() { close(closed) }}
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- p.run(context.Background(), clientToProxyR, io.Discard, serverToProxyR, sw) }()
+
+	// Drain whatever the proxy forwards so pumpClientToServer doesn't block on a full pipe.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := proxyToServerR.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	if err := clientToProxyW.Close(); err != nil { // simulate the client's stdin (our own os.Stdin) hitting EOF
+		t.Fatalf("closing client writer: %v", err)
+	}
+
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy never closed the server's stdin pipe after client input ended — a real subprocess would hang forever")
+	}
+
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run() did not return after client EOF")
+	}
+}
+
+type closeTrackingWriteCloser struct {
+	io.WriteCloser
+	onClose func()
+}
+
+func (c *closeTrackingWriteCloser) Close() error {
+	err := c.WriteCloser.Close()
+	c.onClose()
+	return err
+}
+
+// TestProxyConcurrentWritesToClientDontInterleave drives many large denied
+// tool calls (answered by pumpClientToServer directly) concurrently with many
+// large forwarded server responses (relayed by pumpLines), and asserts every
+// line the client receives is still valid, complete JSON — i.e. no two
+// messages got interleaved mid-write. Run with -race to also catch the data
+// race directly.
+func TestProxyConcurrentWritesToClientDontInterleave(t *testing.T) {
+	p, _ := newTestProxy(t, nil)
+	const n = 200
+	bigText := strings.Repeat("x", 8192) // comfortably larger than typical pipe atomic-write sizes
+
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"text": bigText}}, true
+	})
+
+	go func() {
+		for i := 0; i < n; i++ {
+			// Alternate an allowed call (forwarded, answered by the fake
+			// server) with a denied call (answered directly by the proxy),
+			// so both writers to clientOut are active concurrently.
+			if i%2 == 0 {
+				h.sendClient(t, toolCallRequest(fmt.Sprintf("allow-%d", i), "list_transactions"))
+			} else {
+				h.sendClient(t, toolCallRequest(fmt.Sprintf("deny-%d", i), "refund_customer"))
+			}
+		}
+	}()
+
+	sc := bufio.NewScanner(h.proxyToClientR)
+	sc.Buffer(make([]byte, 4096), maxLineBytes)
+	for i := 0; i < n; i++ {
+		if !sc.Scan() {
+			t.Fatalf("expected %d responses, got %d (err: %v)", n, i, sc.Err())
+		}
+		var out map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &out); err != nil {
+			t.Fatalf("response %d is not valid JSON (interleaved write?): %v\nraw: %s", i, err, sc.Bytes())
+		}
+	}
+}
+
+func TestProxyPassesThroughNonToolCallMethods(t *testing.T) {
+	p, _ := newTestProxy(t, nil)
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		if req.Method != "initialize" {
+			t.Errorf("expected the server to see the untouched 'initialize' method, got %q", req.Method)
+		}
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"protocolVersion": "2024-11-05"}}, true
+	})
+
+	h.sendClient(t, map[string]any{"jsonrpc": "2.0", "id": "0", "method": "initialize", "params": map[string]any{}})
+	resp := h.readClientResponse(t)
+	if _, isError := resp["error"]; isError {
+		t.Fatalf("expected pass-through method to succeed, got %+v", resp)
+	}
+}

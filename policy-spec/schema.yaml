@@ -1,0 +1,234 @@
+# AgentGuard policy DSL — JSON Schema (draft 2020-12), expressed as YAML for readability.
+#
+# Design principle: default-deny. For filesystem, network, shell, mcp, and functions,
+# an action that matches no rule is DENIED. The one deliberate exception is `secrets`,
+# where only `deny` rules are meaningful — exhaustively allow-listing every benign
+# environment variable an agent might legitimately read is impractical, so unlisted
+# env vars are allowed by default and `secrets.deny` exists purely to block
+# known-sensitive ones.
+#
+# Rule precedence: `filesystem` and `functions` are each a single ordered list where
+# the FIRST matching rule wins (in declaration order) — this is what lets you write a
+# narrow allow for a workspace directory (or a narrow argument range) followed by a
+# broader catch-all, the way an ACL or firewall rule list works. Put more
+# specific/restrictive rules before broader ones if they should take priority.
+# `network`, `shell`, and `mcp` instead split allow/deny into separate lists, and
+# `deny` is always checked before `allow` regardless of declaration order, so a
+# safety-critical deny (a raw IP, a destructive shell pattern) always wins even if
+# some allow rule would otherwise also match.
+#
+# Any rule may additionally carry `require_approval: true`, which overrides its
+# effect to REQUIRE_APPROVAL regardless of whether it matched via allow or deny.
+#
+# Filesystem paths are compared after resolving "." and ".." segments (path.Clean),
+# so a rule scoped to a directory cannot be bypassed with a traversal string. This
+# is a logical-layer mitigation, not a filesystem-level guarantee — real symlink
+# escapes require the kernel-level hardened mode (Landlock/seccomp) planned for v0.2.
+$schema: "https://json-schema.org/draft/2020-12/schema"
+title: AgentGuard Policy
+type: object
+required: [version]
+additionalProperties: false
+properties:
+  version:
+    type: integer
+    const: 1
+  name:
+    type: string
+    description: Human-readable policy name, shown in audit logs and CLI output.
+
+  filesystem:
+    type: array
+    description: >
+      Rules for fs_read / fs_write actions. `paths` are glob patterns; `**` matches
+      any number of path segments, `*` matches within a single segment.
+    items:
+      type: object
+      additionalProperties: false
+      properties:
+        allow: { enum: [read, write, read_write] }
+        deny: { enum: [read, write, read_write] }
+        paths:
+          type: array
+          items: { type: string }
+          minItems: 1
+        require_approval: { type: boolean }
+        reason: { type: string }
+      oneOf:
+        - required: [allow, paths]
+        - required: [deny, paths]
+
+  network:
+    type: object
+    additionalProperties: false
+    properties:
+      default: { enum: [allow, deny], default: deny }
+      allow:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [domain]
+          properties:
+            domain: { type: string, description: "exact host, or *.example.com wildcard" }
+            methods:
+              type: array
+              items: { type: string }
+              description: "HTTP methods allowed; omit to allow all methods"
+            require_approval: { type: boolean }
+            reason: { type: string }
+      deny:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          properties:
+            domain: { type: string }
+            ip_literal:
+              type: boolean
+              description: "if true, matches any request whose host is a raw IP address"
+            require_approval: { type: boolean }
+            reason: { type: string }
+
+  shell:
+    type: object
+    additionalProperties: false
+    properties:
+      default: { enum: [allow, deny], default: deny }
+      allow:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [pattern]
+          properties:
+            pattern: { type: string, description: "glob over the full command string; * matches any sequence" }
+            require_approval: { type: boolean }
+            reason: { type: string }
+      deny:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [pattern]
+          properties:
+            pattern: { type: string }
+            require_approval: { type: boolean }
+            reason: { type: string }
+
+  mcp:
+    type: object
+    additionalProperties: false
+    properties:
+      default: { enum: [allow, deny], default: deny }
+      servers:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [name]
+          properties:
+            name: { type: string }
+            default: { enum: [allow, deny] }
+            tools:
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required: [name]
+                properties:
+                  name: { type: string }
+                  allow: { type: boolean }
+                  deny: { type: boolean }
+                  require_approval: { type: boolean }
+                  reason: { type: string }
+
+  functions:
+    type: object
+    additionalProperties: false
+    description: >
+      Governs `function` actions: a generalization of `mcp` for any named
+      call an SDK wraps (see agentguard.Guard.function() in the Python SDK)
+      where policy needs to see the actual argument values, not just the
+      function's name — e.g. "allow charge_customer when amount < 1000,
+      require approval otherwise" rather than allowing or denying every
+      call to charge_customer alike. Unlike network/shell/mcp, `rules` is a
+      single ordered list (like `filesystem`) — first matching rule wins —
+      because argument conditions are typically written as partitioning
+      ranges ("< 1000" then ">= 1000") where declaration order is exactly
+      how you express which one takes priority if ranges ever overlap.
+    properties:
+      default: { enum: [allow, deny], default: deny }
+      rules:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [name]
+          properties:
+            name: { type: string, description: "the function name, as passed to Guard.function()/evaluate_action" }
+            conditions:
+              type: array
+              description: >
+                All conditions must hold (AND) for the rule to match. If
+                omitted or empty, the rule matches any call to `name`
+                regardless of arguments — pure name-based, like an mcp tool
+                rule. A condition referencing an argument the call didn't
+                pass never holds (it doesn't error; the rule just doesn't
+                match, same as any other non-match).
+              items:
+                type: object
+                additionalProperties: false
+                required: [arg, op, value]
+                properties:
+                  arg: { type: string, description: "the argument name to check" }
+                  op:
+                    enum: ["<", "<=", ">", ">=", "=", "==", "!="]
+                    description: >
+                      Ordering operators (< <= > >=) require both the
+                      argument and `value` to be numbers. Equality operators
+                      (= == !=) compare numbers numerically regardless of
+                      whether they came from YAML (int) or JSON (float) and
+                      compare everything else (strings, bools) exactly.
+                  value: {}
+            allow: { type: boolean }
+            deny: { type: boolean }
+            require_approval: { type: boolean }
+            reason: { type: string }
+
+  secrets:
+    type: object
+    additionalProperties: false
+    description: "See note above: only deny rules are meaningful here."
+    properties:
+      deny:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [env_var]
+          properties:
+            env_var: { type: string }
+            require_approval: { type: boolean }
+            reason: { type: string }
+
+  escalation:
+    type: object
+    additionalProperties: false
+    properties:
+      approval_timeout_seconds: { type: integer, default: 300, minimum: 1 }
+      on_timeout: { enum: [allow, deny], default: deny }
+      webhook_url:
+        type: string
+        description: >
+          If set, the daemon POSTs a JSON notification here whenever an
+          action starts requiring approval — compatible with a Slack
+          Incoming Webhook URL as-is (only the "text" field is required for
+          Slack; the payload also carries structured fields for any other
+          consumer). This is a notification channel, not a remote-approval
+          mechanism: resolving the approval still happens via `agentctl
+          approve`/`deny` against the daemon's local-only socket. Only
+          honored by `agentctl daemon start`; the standalone `mcp-proxy` and
+          `proxy start` commands remain TTY-only for approvals in v0.2,
+          since they have no daemon-backed, remotely-resolvable approval ID
+          to notify about.

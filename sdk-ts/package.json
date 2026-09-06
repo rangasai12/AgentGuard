@@ -1,0 +1,16 @@
+{
+  "name": "agentguard",
+  "version": "0.1.0",
+  "description": "Developer-first policy-as-code enforcement for AI agent tool calls",
+  "type": "module",
+  "license": "MIT",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts"
+  },
+  "dependencies": {}
+}

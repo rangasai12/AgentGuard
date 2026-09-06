@@ -1,0 +1,20 @@
+# Locks down a minimal file-tools MCP server: listing and reading files are
+# fine, deleting one is denied outright — with zero changes to the server or
+# client code, only the launch command in client_demo.py routes through
+# `agentctl mcp-proxy` instead of the server directly.
+version: 1
+name: mcp-proxy-demo-policy
+
+mcp:
+  default: deny
+  servers:
+    - name: "demo-files"
+      default: deny
+      tools:
+        - name: "list_files"
+          allow: true
+        - name: "read_file"
+          allow: true
+        - name: "delete_file"
+          deny: true
+          reason: "deletions in this sandbox always go through a human, never the agent directly"
