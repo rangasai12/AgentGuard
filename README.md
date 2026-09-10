@@ -188,7 +188,3 @@ proxy, network proxy, CLI, Python/TS SDKs, macOS hardened mode, CI policy
 testing, Slack/webhook approvals) is built and tested. The cloud dashboard is
 Phase 1 (multi-tenant backend + forwarder + React frontend); see `CHANGELOG.md`
 for the full build log and design rationale behind every piece.
-
-## License
-
-MIT — see `LICENSE`.
