@@ -6,6 +6,7 @@ const PAGE_LABELS: Record<string, [string, string]> = {
   "/events": ["Monitoring", "Live Feed"],
   "/pending": ["Monitoring", "Approvals"],
   "/agents": ["Fleet", "Agents"],
+  "/settings": ["Configuration", "Settings"],
 };
 
 export function Header() {

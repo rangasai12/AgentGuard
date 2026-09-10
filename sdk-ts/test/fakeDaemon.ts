@@ -58,21 +58,42 @@ export class FakeDaemon {
   }
 }
 
+/** A decisionHandler plus the requests it saw, so tests can assert on what
+ * the SDK actually sent. */
+export interface RecordingHandler extends Handler {
+  reports: Record<string, unknown>[];
+  evaluates: Record<string, unknown>[];
+}
+
 /** Builds a handler that answers `evaluate` requests by looking up the
  * action's tool name in `decisions` (defaulting to deny for anything
- * unlisted, matching the real engine's default-deny posture), and answers
- * `ping` unconditionally. */
-export function decisionHandler(decisions: Record<string, Record<string, unknown>>): Handler {
-  return (req) => {
+ * unlisted, matching the real engine's default-deny posture), answers
+ * `ping` unconditionally, and accepts `report` requests, recording each on
+ * `.reports` (and every evaluate on `.evaluates`). Every evaluate answer
+ * carries an `event_id` the way the real daemon's does; `rejectReports`
+ * makes `report` answer `{ok: false}` to test that a failed report never
+ * affects the tool call. Mirrors sdk-python/tests/conftest.py. */
+export function decisionHandler(decisions: Record<string, Record<string, unknown>>, rejectReports = false): RecordingHandler {
+  const reports: Record<string, unknown>[] = [];
+  const evaluates: Record<string, unknown>[] = [];
+  const handler = ((req) => {
     if (req.cmd === "ping") {
       return { ok: true };
     }
     if (req.cmd === "evaluate") {
+      evaluates.push(req);
       const action = (req.action as Record<string, unknown>) ?? {};
       const tool = action.tool as string;
       const decision = decisions[tool] ?? { result: "deny", matched_rule: "default-deny" };
-      return { ok: true, decision };
+      return { ok: true, decision, event_id: evaluates.length.toString(16).padStart(16, "0") };
+    }
+    if (req.cmd === "report") {
+      reports.push(req);
+      return rejectReports ? { ok: false, error: "fake daemon: reports rejected" } : { ok: true };
     }
     return { ok: false, error: `fake daemon: unhandled cmd ${JSON.stringify(req.cmd)}` };
-  };
+  }) as RecordingHandler;
+  handler.reports = reports;
+  handler.evaluates = evaluates;
+  return handler;
 }

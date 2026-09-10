@@ -211,25 +211,41 @@ func (f *forwarder) relayResolutions() error {
 // the new offset. Failing to advance the offset on a failed ship is what
 // makes this safe to retry: a dropped upstream request just means the same
 // bytes get re-read and re-sent next tick.
+//
+// Events are shipped in batches of at most maxShipBatch, looping until the
+// log is drained, since a line can now carry arguments and an output
+// preview and an unbounded backlog would otherwise become one huge POST.
 func (f *forwarder) shipNewEvents() error {
-	events, newOffset, err := readNewEvents(f.auditLogPath, f.state.Offset)
-	if err != nil {
-		return fmt.Errorf("reading audit log: %w", err)
+	for {
+		events, newOffset, err := readNewEvents(f.auditLogPath, f.state.Offset, maxShipBatch)
+		if err != nil {
+			return fmt.Errorf("reading audit log: %w", err)
+		}
+		if len(events) == 0 {
+			return nil
+		}
+		if err := f.client.postEvents(events); err != nil {
+			return fmt.Errorf("posting %d events: %w", len(events), err)
+		}
+		f.state.Offset = newOffset
+		if err := saveState(f.statePath, f.state); err != nil {
+			return err
+		}
+		if len(events) < maxShipBatch {
+			return nil
+		}
 	}
-	if len(events) == 0 {
-		return nil
-	}
-	if err := f.client.postEvents(events); err != nil {
-		return fmt.Errorf("posting %d events: %w", len(events), err)
-	}
-	f.state.Offset = newOffset
-	return saveState(f.statePath, f.state)
 }
+
+// maxShipBatch is the most audit events shipped in one POST /v1/events.
+const maxShipBatch = 500
 
 // readNewEvents reads audit.go's JSONL format starting at byte offset,
 // returning only complete lines (a partial trailing line — the daemon
-// mid-write — is left for the next read) and the new offset to persist.
-func readNewEvents(path string, offset int64) ([]store.IngestedEvent, int64, error) {
+// mid-write — is left for the next read), at most maxEvents of them, and
+// the new offset to persist. Outcome patch lines (kind = "outcome") are
+// shipped as-is; the Control API merges them into the decision they name.
+func readNewEvents(path string, offset int64, maxEvents int) ([]store.IngestedEvent, int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -249,7 +265,7 @@ func readNewEvents(path string, offset int64) ([]store.IngestedEvent, int64, err
 
 	var events []store.IngestedEvent
 	consumed := int64(0)
-	for {
+	for maxEvents <= 0 || len(events) < maxEvents {
 		idx := bytes.IndexByte(data[consumed:], '\n')
 		if idx == -1 {
 			break // partial line; wait for it to be completed next tick
@@ -265,17 +281,38 @@ func readNewEvents(path string, offset int64) ([]store.IngestedEvent, int64, err
 			log.Printf("skipping unparseable audit log line: %v", err)
 			continue
 		}
-		events = append(events, store.IngestedEvent{
-			Timestamp:   ev.Timestamp,
-			Actor:       ev.Actor,
-			ActionType:  string(ev.ActionType),
-			Resource:    ev.Resource,
-			Decision:    string(ev.Decision),
-			MatchedRule: ev.MatchedRule,
-			Reason:      ev.Reason,
-			ApprovalID:  ev.ApprovalID,
-			LatencyMS:   ev.LatencyMS,
-		})
+		ie := store.IngestedEvent{
+			Timestamp:    ev.Timestamp,
+			Actor:        ev.Actor,
+			ActionType:   string(ev.ActionType),
+			Resource:     ev.Resource,
+			Decision:     string(ev.Decision),
+			MatchedRule:  ev.MatchedRule,
+			Reason:       ev.Reason,
+			ApprovalID:   ev.ApprovalID,
+			LatencyMS:    ev.LatencyMS,
+			Kind:         ev.Kind,
+			EventID:      ev.EventID,
+			RunID:        ev.RunID,
+			AgentVersion: ev.AgentVersion,
+			PolicyHash:   ev.PolicyHash,
+		}
+		if ev.Action != nil {
+			if raw, err := json.Marshal(ev.Action); err == nil {
+				ie.Action = raw
+			}
+		}
+		if ev.Outcome != nil {
+			ie.Outcome = &store.EventOutcome{
+				Status:       ev.Outcome.Status,
+				ExecMS:       ev.Outcome.ExecMS,
+				Output:       ev.Outcome.Output,
+				OutputBytes:  ev.Outcome.OutputBytes,
+				OutputSHA256: ev.Outcome.OutputSHA256,
+				Error:        ev.Outcome.Error,
+			}
+		}
+		events = append(events, ie)
 	}
 	return events, offset + consumed, nil
 }

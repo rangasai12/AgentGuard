@@ -1,0 +1,1 @@
+hello from a registered-agent smoke test

@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -144,6 +146,15 @@ type EscalationPolicy struct {
 	WebhookURL string `yaml:"webhook_url,omitempty"`
 }
 
+// AuditPolicy governs what the audit log records about an action, as
+// opposed to whether the action is allowed. RedactArgs lists argument keys
+// (exact, case-sensitive match against Action.Args) whose values are
+// replaced with "[redacted]" before an action is written to the audit log
+// or shown to an approver — policy conditions still see the real values.
+type AuditPolicy struct {
+	RedactArgs []string `yaml:"redact_args,omitempty"`
+}
+
 // Policy is the fully-parsed form of a policy.yaml document.
 type Policy struct {
 	Version    int              `yaml:"version"`
@@ -155,6 +166,13 @@ type Policy struct {
 	Functions  FunctionsPolicy  `yaml:"functions,omitempty"`
 	Secrets    SecretsPolicy    `yaml:"secrets,omitempty"`
 	Escalation EscalationPolicy `yaml:"escalation,omitempty"`
+	Audit      AuditPolicy      `yaml:"audit,omitempty"`
+
+	// Hash identifies the exact policy text this Policy was parsed from
+	// (first 12 hex chars of its SHA-256), so an audit event can say which
+	// policy made the decision. Set by ParsePolicy; empty for a Policy built
+	// in code.
+	Hash string `yaml:"-"`
 }
 
 // HasNetworkRules reports whether the policy expresses any intent to govern
@@ -191,6 +209,8 @@ func ParsePolicy(data []byte) (*Policy, error) {
 	if err := p.Validate(); err != nil {
 		return nil, err
 	}
+	sum := sha256.Sum256(data)
+	p.Hash = hex.EncodeToString(sum[:])[:12]
 	return &p, nil
 }
 
@@ -323,7 +343,38 @@ func (p *Policy) Validate() error {
 	if u := p.Escalation.WebhookURL; u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		return fmt.Errorf("escalation.webhook_url: must start with http:// or https://, got %q", u)
 	}
+	for i, k := range p.Audit.RedactArgs {
+		if k == "" {
+			return fmt.Errorf("audit.redact_args %d: key must not be empty", i)
+		}
+	}
 	return nil
+}
+
+// RedactArgs returns args with every key listed in audit.redact_args
+// replaced by "[redacted]". The input map is never mutated: when nothing
+// needs redacting it is returned as-is, otherwise a copy is returned.
+func (p *Policy) RedactArgs(args map[string]any) map[string]any {
+	if len(args) == 0 || len(p.Audit.RedactArgs) == 0 {
+		return args
+	}
+	var out map[string]any
+	for _, k := range p.Audit.RedactArgs {
+		if _, ok := args[k]; !ok {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]any, len(args))
+			for kk, vv := range args {
+				out[kk] = vv
+			}
+		}
+		out[k] = "[redacted]"
+	}
+	if out == nil {
+		return args
+	}
+	return out
 }
 
 func validateDefault(v, section string) error {

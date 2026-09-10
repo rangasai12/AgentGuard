@@ -1,6 +1,6 @@
 # Changelog
 
-Running log of significant implementation decisions and milestones, kept alongside git history so the reasoning behind the code is easy to find later. See `/Users/rangasaiyalaka/.claude/plans/this-is-a-new-glimmering-pretzel.md` for the original product plan this build follows.
+Running log of significant implementation decisions and milestones, kept alongside git history so the reasoning behind the code is easy to find later. Contributor rules (the anti-duplication guardrail and the entry template every milestone below follows from 2026-09-09 on) live in `docs/conventions.md`. See `/Users/rangasaiyalaka/.claude/plans/this-is-a-new-glimmering-pretzel.md` for the original product plan this build follows.
 
 ## 2026-09-04 — Project bootstrap + policy engine (PDP) v0.1
 
@@ -1042,3 +1042,969 @@ verification against the live Go backend: `GET /api/events`,
 `[]`, since a client-side null-check is one line per page and every other
 JSON API a browser talks to has the same footgun — not worth a special
 case in three handlers for it.
+
+## Contributor conventions — the anti-duplication guardrail becomes a repo artifact
+
+### Why
+The next body of work (closing observability gaps identified in a
+competitive review on 2026-09-09: outcome capture, anomaly detection, agent
+versions, per-agent profiles, run grouping, alerting, two new framework
+adapters, and a compliance export) touches every layer of the repo at once.
+The review that
+preceded it found the codebase already carried three copies of the
+"evaluate → maybe await approval → write an audit event" sequence
+(`daemon.Daemon.Evaluate`, `proxy/mcp.(*Proxy).evaluate`,
+`proxy/network.(*Proxy).evaluate`) and five inline copies of
+"check → raise PolicyDenied → call the tool" in the Python SDK. The user asked
+for a mechanical guardrail against that drift, not good intentions: every new
+symbol must be justified in writing, before it is coded, against the closest
+thing that already exists.
+
+### What changed
+- New `docs/conventions.md`: the rule, a canonical "one of each" symbol
+  registry (audit event shape, decision funnel, socket clients, test fakes,
+  ingest endpoint, events table, polling hook, webhook sender, time parser,
+  adapter field accessor, nav entries), the end-of-milestone grep check that
+  each new name has exactly one definition, and the CHANGELOG entry template
+  every entry from here on follows (`### Why`, `### What changed`,
+  `### Guardrail: why new code`, `### Deferred / known gaps`,
+  `### Verification run at this milestone`).
+- `README.md` gains a short "Contributing" section pointing at it;
+  this file's preamble points at it too.
+
+### Guardrail: why new code
+`docs/conventions.md` is the first contributor-facing document in the repo.
+The closest existing things are `README.md` and `docs/sdk-guide.md`, both
+user-facing; there is no `CLAUDE.md`, and CHANGELOG entries are per-milestone
+narratives rather than a standing rule. A standing rule belongs in one stable
+location that is linked from both.
+
+### Deferred / known gaps
+The registry names symbols that later milestones will introduce
+(`daemon.Decide`, `daemon.AuditLogger.Report`, `daemon.newHexID`). They are
+listed now so the milestone that adds each one has a pre-declared home to
+check against, not because they exist yet.
+
+### Verification run at this milestone
+- `grep -n conventions.md README.md CHANGELOG.md` — both pointers present.
+- No code changed; no test run needed.
+
+---
+
+## Audit events carry the full action, run/version identity, and execution outcome — one decision funnel for daemon, MCP proxy, and network proxy
+
+### Why
+An audit event today records *that* a decision was made and the flattened
+resource string it was about. It does not record the arguments the tool was
+called with, what the tool returned, whether it failed, or how long it ran,
+and it has no notion of which run of which version of which agent produced
+it. Everything the competitive review identified as missing (per-agent
+behavioral profiles, version-to-version change detection, anomaly
+detection, run grouping, a compliance export) needs those fields, so this
+milestone adds them once, at every layer, so no later milestone migrates
+the same columns again.
+
+### What changed
+- **`daemon.AuditEvent`** grows `event_id`, `kind`, `run_id`,
+  `agent_version`, `policy_hash`, `action` (the structured `engine.Action`,
+  arguments included, after redaction) and `outcome`. Old log lines still
+  parse; the new fields are simply empty. `latency_ms` keeps its original
+  meaning (policy evaluation plus any approval wait); tool execution time is
+  `outcome.exec_ms`.
+- **`daemon.Decide`** is the one decision funnel. `Daemon.Evaluate` takes a
+  `DecisionRequest` and delegates to it with the broker-backed `Awaiter`;
+  `proxy/mcp` and `proxy/network` call it with `PromptAwaiter(p.Approve)`.
+  Their private `evaluate` copies are gone. `grep 'Audit.Log('` outside
+  tests now finds exactly one call site.
+- **Argument redaction**: new policy section `audit.redact_args: [keys]`
+  (schema + `Validate`). `Decide` evaluates the real arguments, then
+  redacts before the action reaches an approver or the log, so a condition
+  like `password = hunter2` still works while the log shows `[redacted]`.
+- **`engine.Policy.Hash`**: first 12 hex of the SHA-256 of the policy text,
+  set by `ParsePolicy`, stamped on every event as `policy_hash`.
+- **Socket protocol**: `evaluate` accepts `run_id` / `agent_version` and
+  returns `event_id`; new `report` command (`id` = that event id, `outcome`
+  = `{status, exec_ms, output, output_bytes, output_sha256, error}`).
+  `AuditLogger.Report` patches the in-memory ring entry in place and appends
+  a `kind:"outcome"` line to the JSONL file; it validates the id and status,
+  fills `output_bytes`/`output_sha256` from the full output when the caller
+  left `output_bytes` zero, and truncates the stored preview (4 KiB default,
+  64 KiB hard cap, never splitting a UTF-8 rune). `audit_query` gains
+  `run_id` and `event_id` filters.
+- **MCP proxy** now parses `tools/call` `arguments` into `Action.Args`,
+  remembers each forwarded call by JSON-RPC id, and — inside the existing
+  server→client pump, now `pumpServerToClient` — matches responses (lines
+  with an id and no `method`, so a server's own requests are never
+  mistaken for responses) to report status, duration, and a preview/size/
+  hash of `result`. A JSON-RPC `error` or `result.isError` records an
+  error outcome. Denied calls are never in flight and get no outcome.
+- **Network proxy** records `{"path": ...}` as the action's args (query
+  string deliberately omitted), and after relaying the response reports
+  the status line, relayed byte count, round-trip time, and `error` for
+  4xx/5xx or a failed upstream dial. Bodies are streamed, never captured.
+- **CLI**: `agentctl mcp-proxy` and `agentctl proxy start` take
+  `--run-id` / `--agent-version` (defaulting to `$AGENTGUARD_RUN_ID` /
+  `$AGENTGUARD_AGENT_VERSION`, which an SDK-wrapped parent exports).
+  `agentctl audit tail|query` print an outcome column (`success/17ms`).
+- **Forwarder** ships every new field (the action as raw JSON), ships
+  outcome patch lines as-is, and now reads at most 500 events per POST,
+  looping until the log is drained.
+- **Cloud store**: twelve `ALTER TABLE audit_events ADD COLUMN IF NOT
+  EXISTS` statements plus three indexes, and `agents.last_agent_version` /
+  `last_policy_hash`. `InsertEvents` turns a `kind:"outcome"` event into an
+  `UPDATE … WHERE tenant_id AND agent_id AND event_id AND outcome = ''`
+  (so a patch can never cross tenants or overwrite a reported outcome) and
+  records the batch's last version/policy on the agent row. `QueryEvents`
+  scans the new columns via one `scanEvent` helper kept beside its SELECT;
+  `EventFilter` gains `RunID`, `AgentVersion`, `Outcome` (`success`,
+  `error`, or `none` for not-yet-reported). Ingest is capped at 5000
+  events / 16 MiB per request.
+- **Web API / frontend**: `GET /api/events` accepts `run_id`,
+  `agent_version`, `outcome`; `Agent` carries the last version/policy.
+  The Live Feed gains an Outcome column and, in the detail panel, run,
+  version, policy hash, outcome with execution time, arguments, error, and
+  the output preview (labelled "first N of M bytes" when truncated).
+  `DecisionBadge` renders outcome statuses too rather than adding a
+  second badge component. The CSV export gains the new columns.
+
+### Guardrail: why new code
+Written before the code, per `docs/conventions.md`. Each new symbol, the
+closest existing thing, and why that thing could not simply be extended:
+
+- **`daemon.Decide`** — closest: `daemon.Daemon.Evaluate`. It *is* that
+  function's body, extracted so `proxy/mcp` and `proxy/network` can call it
+  instead of carrying their own copies (they did: `(*Proxy).evaluate` in each
+  package was a near byte-for-byte duplicate of `Evaluate` minus the broker).
+  `Daemon.Evaluate` becomes a thin wrapper. Net effect is fewer
+  implementations, not more.
+- **`daemon.DecisionRequest`** — closest: the positional `(actor, action)`
+  parameters of `Evaluate`. Two more identity fields (run id, agent version)
+  would make a five-argument positional call; a request struct is the
+  existing idiom in this package (`Request`, `EvaluateResult`).
+- **`daemon.Awaiter`** and **`daemon.PromptAwaiter`** — closest:
+  `approval.Func` and `daemon.Notifier`. `Decide` needs to ask "how do I wait
+  for a human?" without knowing whether the answer is the daemon's broker or
+  a proxy's TTY prompt; `approval.Func` returns no approval id and cannot
+  reach the broker, `Notifier` only announces. `PromptAwaiter` is the one
+  adapter both proxies use instead of each repeating the
+  `if Approve != nil … fall back to on_timeout` block they had.
+- **`daemon.Outcome`** — closest: more flat fields on `AuditEvent`. It is
+  the payload of the new `report` request *and* the sub-object on the event,
+  so one type keeps the wire format and the log format identical by
+  construction. It is a parameter bag, not a second event struct.
+- **`daemon.AuditLogger.Report`** — closest: `AuditLogger.Log`. `Log` is
+  append-only by design and nothing today mutates a recorded event. `Report`
+  is the single writer of outcome patch lines and the only code that patches
+  the in-memory ring; every enforcement point calls it rather than writing
+  its own patch.
+- **`daemon.newHexID`** — closest: `newApprovalID`. Same generator with the
+  byte count as a parameter; `newApprovalID` is removed, not kept alongside.
+- **`engine.Policy.Hash`** and **`engine.AuditPolicy`** — closest: nothing.
+  No field records which policy text produced a decision, and no policy
+  section governs what the audit log stores. `audit.redact_args` is applied
+  inside `Decide` so every surface redacts identically.
+- **`proxy/mcp` in-flight map** — closest: nothing; the proxy never
+  correlated a request with its response. It lives inside the existing
+  server→client pump (renamed `pumpServerToClient`) rather than a second
+  goroutine or a second scanner.
+- **`proxy/network` counting writer** — closest: nothing counts relayed
+  bytes today. Six lines wrapping the existing `resp.Write(conn)`.
+- **First `ALTER TABLE … ADD COLUMN IF NOT EXISTS` in `schema.sql`** —
+  closest: the existing `CREATE … IF NOT EXISTS` statements. Same
+  idempotent, applied-on-every-boot model; no migration runner is added.
+- **Socket command `report`** — closest: `evaluate`. The SDK clients are
+  connect-per-call and the proxies never use the socket for evaluate at all,
+  so holding a connection open to send a second line was rejected; a
+  separate command reusing the existing `Request.ID` field (as `approve` and
+  `deny` do) is the smallest addition.
+
+Deliberately *not* added: a second event row per call (would double-count
+in every existing aggregate), a rollup table, a scheduler, a new socket
+client, a new test fake, a new audit logger.
+
+### Deferred / known gaps
+- **Hardened mode stays silent.** `agentctl run` emits no audit events;
+  kernel-level denials by `sandbox-exec` are not policy decisions and
+  synthesising events for them would need a new action type and a fragile
+  unified-log tail. A child launched under it inherits `$AGENTGUARD_RUN_ID`,
+  so anything it does through the SDK/MCP proxy/network proxy is grouped.
+- **Outcome patch lines carry empty decision fields.** The original nine
+  fields are not `omitempty`, so a `kind:"outcome"` line prints
+  `"decision":""` etc. Readers must key on `kind`; changing those tags would
+  alter the JSON of decision lines that older tooling already parses.
+- **MCP in-flight map is unbounded.** A call whose response never arrives
+  stays until the proxy exits. Proxies are one-per-session processes, so
+  this is documented rather than evicted.
+- **Network response bodies are never captured**, by decision; an opt-in
+  tee for text content types is possible later without a schema change.
+- **Redaction is exact-key only** (case-sensitive, top-level). Nested keys
+  and pattern matching were not asked for.
+- The SDKs do not yet send `run_id`/`agent_version` or report outcomes;
+  that is the next milestone. Until then their events have empty identity
+  fields and no outcome, exactly like pre-existing log lines.
+
+### Verification run at this milestone
+- Toolchain first: `go.mod` requires Go 1.26.0 and the machine's
+  `/usr/local/go` is 1.25.5; the cached 1.26.0 toolchain under
+  `~/go/pkg/mod/golang.org/toolchain@…` had been half-extracted (no
+  `bin/go`), so every `go` command failed before any code was touched.
+  Verified the cached zip was intact (`unzip -t`, contains `bin/go`),
+  removed only the partial extraction directory, and Go re-extracted it:
+  `go version` → `go1.26.0 darwin/arm64`.
+- `go test -p 1 ./...` before any change: all 12 packages pass (baseline).
+- `go build ./... && go vet ./...` — clean.
+- `go test -race -p 1 ./...` after all changes — all packages pass:
+  approval, cli, cmd/agentguard-forwarder, daemon, dashboard/server,
+  dashboard/store, engine, hardened, proxy/mcp, proxy/network. Extended
+  tests: `TestAuditLogPersistsToFile`, `TestSocketAPIEvaluateAllowAndDeny`,
+  `TestDaemonEvaluateAllowIsLogged`, `TestProxyForwardsAllowedToolCall`,
+  `TestPlainHTTPAllowedRequestIsForwarded`,
+  `TestForwarderShipsNewAuditEvents`,
+  `TestAgentRegistrationAndEventIngestionEndToEnd`, `TestTenantIsolation`.
+  New: `TestRedactArgsAppliedBeforeAudit`,
+  `TestAuditReportUnknownEventStillAppendsPatch`,
+  `TestAuditReportTruncatesOversizedOutput`,
+  `TestSocketAPIReportOutcomeRoundTrip`, `TestParsePolicySetsHash`,
+  `TestRedactArgs`, `TestProxyRecordsErrorOutcomeFromJSONRPCError`,
+  `TestProxyDeniedCallHasNoOutcome`, `TestReadNewEventsBatches`.
+- Two real bugs the tests caught before anything shipped: (1) `Report`
+  hashed whatever `Output` it was given whenever the hash was empty, so the
+  network proxy's status line ("200 OK") got a SHA-256 that would have
+  masqueraded as a hash of the response — fixed by deriving size and hash
+  only when the caller left `output_bytes` zero, i.e. sent the whole
+  output; the doc comment now states that contract. (2) The forwarder test
+  compared the stored `action` JSON as a substring, but Postgres
+  re-serialises JSONB with spaces after colons — the data was right, the
+  assertion was wrong; it now unmarshals into `engine.Action`.
+- `cd sdk-python && pytest` — 36 passed (unchanged SDK against the changed
+  protocol; extra response fields are ignored). `cd sdk-ts && npm test` —
+  27 passed. `examples/openai-coding-agent` tests against a real built
+  `agentctl` daemon — 13 passed.
+- `cd dashboard/web && npm run build` — clean; `oxlint` reports only the
+  three pre-existing warnings in files this milestone did not touch.
+- Guardrail grep: `Audit.Log(` outside tests = 1 (inside `Decide`); one
+  definition each of `Decide`, `AuditLogger.Report`, `newHexID`,
+  `PromptAwaiter`, `Outcome`, `DecisionRequest`, `Policy.RedactArgs`; zero
+  hits for the removed `newApprovalID`, `pumpLines`, `(*Proxy).evaluate`.
+- **Manual end-to-end smoke** with freshly built `agentctl`,
+  `agentguard-cloud` (against a scratch `agentguard_smoke` Postgres
+  database) and `agentguard-forwarder`: signed up a tenant and added an
+  agent through the Web API; sent `evaluate` for a `function` action with
+  `run_id`/`agent_version` and a `password` argument over the raw socket
+  with `nc`, got an `event_id` back; sent `report` for it; sent a denied
+  `fs_write`. `agentctl audit tail` showed `success/17ms` on the first row
+  and `-` on the denied one. The JSONL held three lines (two decisions,
+  one outcome patch) with `"password":"[redacted]"` while the policy
+  condition had seen the real value. The forwarder registered with the
+  one-time token and shipped in one tick; `GET /api/events` returned two
+  rows, the first merged with its outcome (`reported_at` set, hash and
+  size present), `args` redacted, `policy_hash` `6dd931d9057a`; the agent
+  row showed `last_agent_version=1.0.0` and that hash; Postgres:
+  `count(*)=2`, `count(outcome<>'')=1`.
+
+---
+
+## SDKs report tool outcomes, carry run/version identity, and `agentctl policy record` turns audit history into policy tests
+
+### Why
+The daemon can now store what a tool returned and how long it ran, but the
+two SDKs — the surfaces most agents actually go through — still only ask
+"may I?" and never say what happened. They also send no run id or agent
+version, so every SDK-originated event is anonymous in the ways the
+dashboard is about to care about. Separately, `agentctl policy test` has
+always needed hand-written trace files; now that audit events carry the
+structured action, real history can become the regression suite.
+
+### What changed
+- **Python SDK** (`sdk-python/agentguard/guard.py`): every wrapper now
+  goes through one path — `_decide` (the single `evaluate` call, now
+  carrying `run_id` and `agent_version`) → `_guarded_call` (raise
+  `PolicyDenied` unless allowed) → `_execute` (time the tool, report
+  success or the exception, re-raise unchanged) → `_report` (best-effort
+  `report`; a dropped or rejected report never touches the tool's result).
+  `_wrap_callable` builds the wrapper for `tool`, `checked`, `function`,
+  and `_wrap_attr`, producing an `async def` for coroutine functions
+  (policy check in a thread via `asyncio.to_thread`, so an approval wait
+  never blocks the loop; outcome reported after the await). `check` and
+  `evaluate_action` are one-liners over `_decide`; the public surface is
+  unchanged. New `Guard(agent_version=, run_id=, capture_output=,
+  max_output_bytes=)`; `run_id` is generated when absent and exported to
+  `AGENTGUARD_RUN_ID` (as is `AGENTGUARD_AGENT_VERSION`), so children
+  such as an MCP server behind `agentctl mcp-proxy` inherit the identity.
+- **Arguments on every decision**: `checked`/`function`/`tool`/`wrap_tools`
+  bind the call's arguments by parameter name (`_bind_args`, falling back
+  to `{args, kwargs}` for non-introspectable callables) and
+  `check_and_execute` records its `args` value; string values over 16 KiB
+  are cut with a `…[truncated, N chars]` marker (`_capture_args`) so an
+  argument can never push an evaluate past the daemon's 1 MiB line limit
+  and turn into a blocked tool. `DaemonClient.call` serialises with
+  `default=str` so a `Path`/`Decimal`/dataclass argument cannot break the
+  request. Output previews are JSON-encoded (`default=str`), sized and
+  SHA-256'd in full, then cut on a UTF-8 boundary to `max_output_bytes`.
+- **TypeScript SDK** (`sdk-ts/src/guard.ts`): the same collapse —
+  `decide` / `guardedCall` / `execute` / `report`, `captureArgs` /
+  `positionalArgs` (JavaScript has no parameter names, so positional
+  calls record `{args: [...]}` and a single object argument its keys),
+  `GuardOptions.agentVersion/runId/captureOutput/maxOutputBytes`, env
+  export, `node:crypto` hashing (no new dependency). `wrapAttr` now awaits
+  the original so the timing is real. `adapters/vercel.ts` calls
+  `guard.checkAndExecute` instead of re-implementing check-and-deny (a
+  pre-existing duplication; `throw new PolicyDenied` now has exactly one
+  site in `src/`).
+- **Test fakes**: `decision_handler` (Python) and `decisionHandler` (TS)
+  answer `report`, return an `event_id` on every evaluate, and expose the
+  requests they saw (`.reports`, `.evaluates`); `reject_reports` /
+  `rejectReports` simulate a daemon that refuses reports.
+- **`agentctl policy record`** (`cli/policy_cmd.go`): queries the daemon's
+  audit ring (same `audit_query` command and — via the new shared
+  `addAuditFilterFlags` in `cli/audit_cmd.go` — the same
+  `--type/--decision/--actor/--run` flags as `audit query`, which gains
+  `--run`), keeps events that carry a structured action, and writes an
+  `engine.TestSuite` YAML with the engine's own decision as `want`
+  (`require_approval` for anything that went through an approval,
+  regardless of how a human resolved it). `--output` writes a file, else
+  stdout; the summary goes to stderr so stdout stays a valid trace file.
+- **Docs**: `docs/sdk-guide.md` gains "Outcomes", "Run and version
+  identity", the recording workflow under "Testing your integration", the
+  three new env vars, and a corrected MCP-arguments limitation
+  (arguments are now captured; `mcp` rules still have no conditions).
+  `sdk-ts/README.md` mirrors it. `docs/conventions.md` registry updated.
+
+### Guardrail: why new code
+Written before the code, per `docs/conventions.md`.
+
+- **Python `Guard._decide` / `_guarded_call` / `_execute` / `_report`** —
+  closest: the five inline copies of "evaluate → raise PolicyDenied → call
+  the function" in `checked`, `function`, `check_and_execute`, `tool`, and
+  `_wrap_attr`, plus the two near-identical `evaluate` request bodies in
+  `check` and `evaluate_action`. The new helpers *replace* those copies;
+  they are the only code that ever holds a tool's return value, so outcome
+  capture has exactly one implementation. `check`/`evaluate_action` become
+  one-line wrappers; the public API does not change.
+- **Python `Guard._wrap_callable`** — closest: the four decorator bodies
+  above. One factory that builds a sync or `async def` wrapper (so
+  frameworks that test `inspect.iscoroutinefunction` still see the right
+  kind) instead of four hand-rolled closures.
+- **TypeScript `Guard.decide` / `guardedCall` / `execute` / `report`** —
+  the same collapse of `check`, `checkAndExecute`, `tool`, `wrapAttr`, and
+  `adapters/vercel.ts` (which re-implemented check-then-deny on its own and
+  now calls `guard.checkAndExecute`).
+- **`DaemonClient.call` serialises with `default=str`** (Python) — closest:
+  the existing one-line `json.dumps`. Arguments are now sent on every
+  evaluate and may contain non-JSON objects; this is a change to the one
+  client, not a second serializer.
+- **Test fakes** — `decision_handler` / `decisionHandler` learn `report`
+  and return an `event_id`; no new fake.
+- **`agentctl policy record`** — closest: `agentctl audit query` (same
+  socket command, same filters) and `engine.TestSuite` (same YAML shape,
+  already the target of `policy test`). The audit filter flags are
+  extracted from `audit_cmd.go` into one `addAuditFilterFlags` used by both
+  commands; the recorder is a conversion, not a second query path or a
+  second file format.
+
+### Deferred / known gaps
+- `guard.check()` (name-only, no arguments) and `wrap_tools` on objects
+  whose call attribute is a C-implemented callable record no argument
+  names — `{args, kwargs}` buckets instead. Frameworks with real Python
+  signatures (LangChain tools, plain functions) get named arguments.
+- The TypeScript SDK still has no `evaluateAction` (Python has had one
+  since the demo-agent milestone); not added here because nothing in this
+  milestone needed it, and parity work is its own change.
+- `policy record` reads the daemon's in-memory ring (the last 2000
+  events), not the JSONL file; recording a longer history means recording
+  before the ring rolls, or pointing the cloud export (a later milestone)
+  at the same conversion.
+- Arguments redacted by `audit.redact_args` replay as `"[redacted]"` in a
+  recorded trace, so a `functions` condition on a redacted key will not
+  reproduce under `policy test`. Documented in the SDK guide and in the
+  command's doc comment.
+- No lint/format tooling is configured for the SDKs (unchanged gap);
+  `pyflakes` is run by hand.
+
+### Verification run at this milestone
+- `cd sdk-python && pytest -q` — 47 passed (36 before). The two
+  `@guard.checked` tests whose assertions pinned the exact action sent
+  were updated to expect the new `args` field — a deliberate behaviour
+  change, not a regression. New: success-with-timing/preview/size/hash,
+  exception-reports-error-and-reraises, truncation on a rune boundary,
+  `capture_output=False` keeps status+timing, rejected report never
+  breaks the call, denied call sends no report, async tool reported after
+  await (and still `iscoroutinefunction`), run id/version sent and
+  exported, run id inherited from env, long string args capped, non-JSON
+  args (a `Path`) do not break evaluate; the LangChain-style wrap test now
+  also asserts a report.
+- `cd sdk-ts && npm test` — 37 passed (27 before), mirroring the above;
+  the Vercel adapter tests pass unchanged on the deduplicated adapter.
+- `python3 -m pyflakes agentguard tests` — clean.
+- `go test -race ./cli/` — passes in 1.4s, including the new
+  `TestRunPolicyRecordProducesSuiteThatPasses` (live daemon: two shell
+  commands, a `function` with args, and an approval-gated command that
+  the test *denies* — recorded as `want: require_approval` — then the
+  recording replayed through `runPolicyTest`: `4 passed, 0 failed`; a
+  `--run --decision deny` recording on stdout parses and holds 2 cases).
+  One real mistake caught by running it: the first version of that test
+  let the approval-gated evaluate wait out the CLI policy's default 300s
+  timeout, so the package took 301s; it now resolves the approval the
+  way `audit_approve_test.go` does.
+- `go test -race -p 1 ./...` — all packages pass.
+- `examples/openai-coding-agent` tests against a real built daemon with
+  the reporting SDK — 13 passed.
+- Guardrail grep: one definition each of `_decide`, `_guarded_call`,
+  `_execute`, `_report`, `_wrap_callable`, `_capture_args`, `_bind_args`
+  (Python), `decide`, `guardedCall`, `execute`, `report`, `captureArgs`,
+  `positionalArgs` (TS), `addAuditFilterFlags`, `runPolicyRecord` (Go);
+  `raise PolicyDenied` at two code sites in `guard.py` (the sync and async
+  paths) and none in the adapters; `throw new PolicyDenied` at one site
+  in `sdk-ts/src`; no hand-built `daemon.AuditFilter{}` outside the
+  shared flag builder.
+- **Real cross-language interop test** (Python SDK → Go daemon, the
+  standard this repo holds every protocol change to): with a freshly
+  built `agentctl` daemon and a policy carrying an `mcp` allow/deny pair,
+  a `functions` rule with an `amount < 100` condition plus a
+  `require_approval` fallback (1s timeout), and `audit.redact_args:
+  [card]`, a plain Python script using `@g.tool()`, `@g.function()`, and
+  an `async` tool: the exported `AGENTGUARD_RUN_ID` matched `g.run_id`;
+  a 5 KB tool result was reported with `output_bytes=5040` and a 4096-byte
+  preview; `charge(10, card=…)` allowed and reported; `charge(42, …)`
+  raised inside the tool and was reported as `error … RuntimeError: card
+  declined` while the exception still reached the caller; `charge(500,
+  …)` required approval, timed out to deny, and raised `PolicyDenied`;
+  the async `send_email` was denied by the `mcp` rule. `agentctl audit
+  tail` showed `success/0ms`, `error/0ms`, and `-` in the outcome column;
+  every decision line held `"card":"[redacted]"`. `agentctl policy record
+  --output` wrote 5 cases (the approval-gated one as `want:
+  require_approval`) and `agentctl policy test` replayed them `5 passed,
+  0 failed`; `policy record --run <id> --decision deny` on stdout held
+  the two denied cases.
+
+---
+
+## Agent versions, per-agent profiles, scope keys, tool descriptions, and automatic versioning (plan Phase 3)
+
+### Why
+
+A per-agent behavioral profile with task and tool breakdowns and change
+detection across agent versions was flagged as a differentiator worth
+matching in the competitive review. After
+Phases 1–2 every event carries a version, arguments, an outcome, and timing,
+but the dashboard only ever aggregated allow/deny counts for a whole tenant.
+This milestone makes the same aggregation answer "what does *this agent at
+this version* do, and how is that different from the previous version",
+and lays down the two inputs the Phase 4 anomaly detector needs: a stable
+grouping key for resources and a description for every tool so it can be
+classified.
+
+Design revisions agreed on 2026-09-09 before this phase started (recorded
+in the plan file): scope keys normalized per action type so file paths and
+shell commands do not explode the footprint; tool descriptions captured at
+wrap time for a one-time LLM verb classification in Phase 4; automatic
+agent versions so version-aware baselines work without customers setting
+anything.
+
+### What changed
+
+**Engine.** `engine.ScopeKey(actionType, resource)` (`engine/scope.go`)
+normalizes a resource into the footprint key: fs paths → parent directory
+with a trailing slash, shell → first token, everything else unchanged,
+prefixed with the action type. `engine.Action` gained `Description`
+(json/yaml `omitempty`; the evaluator ignores it). `daemon.Decide` caps it
+at `daemon.MaxDescriptionBytes` (512) before logging.
+
+**Store.** `audit_events.scope_key` (`ALTER … ADD COLUMN IF NOT EXISTS`) is
+computed once in `InsertEvents`; readers use
+`COALESCE(NULLIF(scope_key,''), resource)` so rows from before the column
+still group. New `tool_catalog` table keyed `(tenant_id, action_type,
+resource)` for `mcp_tool` / `function` actions only: `InsertEvents` folds
+each batch into one upsert per distinct tool (`observeTool`,
+`queueToolCatalogUpserts` in `store/tools.go`), keeping an existing
+description when a later batch has none and accumulating argument names.
+`Store.ListToolCatalog` reads it. `Store.Metrics` now takes
+`MetricsFilter{Since, Until, AgentID, AgentVersion, RunID}` and returns,
+besides the original five fields, `TotalCount`, `ReportedCount`,
+`ErrorCount`, `DistinctResources` (distinct scope keys), `ByActionType`,
+`TopResources` (top 20 scope keys), `ExecP50MS` / `ExecP95MS`
+(`percentile_cont`, nil with no samples), `ExecSamples`, `EventsPerHour`,
+`FirstSeen` / `LastSeen`, and — only when `AgentID` is set — `Versions`
+(every version the agent ever sent, most recent first, ignoring the other
+filters so it can drive a selector). One aggregate query with `FILTER`
+clauses replaced the `GROUP BY decision` query; `topN` takes a limit.
+
+**Web API.** `GET /api/metrics` reads `agent_id`, `agent_version`,
+`run_id`. New `GET /api/tools` (viewer) lists the catalog.
+
+**Frontend.** `api.metrics(tenantId, filters)` takes an options object.
+`StatCard` and `RankList` moved to `components/` (RankList gained an
+optional `describe` tooltip callback and a `compact` variant). The Fleet
+table gained sortable Version and Policy columns; clicking a row opens
+`AgentDetailPanel` in the Live Feed's `split-view`: a version selector
+(defaulting to the agent's latest), a six-cell stat grid, action-type and
+footprint rank lists (tool descriptions from the catalog as tooltips), and
+a "current vs. previous version" delta table (events/hour, deny rate,
+error rate, p50/p95 exec, distinct resources, new resources). Two
+`usePolling` calls, no new page or route.
+
+**MCP proxy.** `handleClientLine` remembers the ids of forwarded
+`tools/list` requests; `observeServerLine` reads each tool's description
+out of the matching response; the first `tools/call` to each tool carries
+it (`descriptionFor`).
+
+**SDKs.** Both wrappers now record, at wrap time, each tool's description
+(docstring first paragraph / `.description` / Vercel definition
+`description` / explicit argument to `tool()`) and signature. The
+description rides on the first evaluate per tool per process
+(`_with_description` / `withDescription`). When no `agent_version` is
+given and `auto_version` (`autoVersion`) is on — the default — the Guard
+derives one: `git:<12 hex>` from the nearest `.git` above the working
+directory (`HEAD`, loose refs, packed-refs, worktree `gitdir:` files; no
+`git` binary), else `tools:<12 hex>` over the sorted tool signatures,
+frozen at the first decision. Derived versions are exported to
+`AGENTGUARD_AGENT_VERSION` like explicit ones. `Guard.remember_description`
+/ `rememberDescription` is public for adapters whose tool shape the
+wrappers do not recognize (the Vercel adapter uses it).
+
+**Docs.** `docs/sdk-guide.md` ("Run and version identity" rewritten, new
+"Tool descriptions"), `sdk-ts/README.md`, `docs/conventions.md` registry
+(seven new rows; the forbidden list gained "a second tool table, a second
+metrics function, a second resource-normalization rule").
+
+### Guardrail: why new code
+
+Every existing symbol named in the plan for this phase was extended rather
+than twinned:
+
+- `store.Metrics` grew a `MetricsFilter` parameter and a dozen fields. It
+  is still the one aggregation function; the per-agent profile, the version
+  comparison, and (in Phase 4) both anomaly windows all call it. There is
+  no `Profile` or `AgentStats` function.
+- `store.topN` grew a limit parameter instead of a second top-N helper.
+- `handleMetrics` reads three more query parameters; `api.metrics` takes an
+  options object. No `/api/agents/{id}/profile` endpoint.
+- `AgentsPage.tsx` gained a detail panel using the Live Feed's existing
+  `split-view` / `detail-panel` CSS and a second `usePolling` call. No new
+  page, route, or nav entry.
+- `RankList` and `StatCard` **moved** from `OverviewPage.tsx` into
+  `components/` because two pages now render them; the Overview page
+  imports them from there. Not copied.
+- `engine.Action` gained `Description`; `daemon.Decide` and the audit event
+  carry it for free because the structured action is already logged and
+  shipped verbatim.
+- `Guard._wrap_one` / `wrapOne` and `tool()` read the description off the
+  shapes they already recognize; `_tool_action` / `toolAction` attach it.
+  No new wrapping path.
+- The MCP proxy's existing `observeServerLine` picks descriptions out of a
+  `tools/list` response; `handleClientLine` attaches them. No second pump
+  or parser.
+
+New symbols, and why the closest existing one could not absorb them:
+
+- **`engine.ScopeKey(actionType, resource)`.** Closest: `Action.Resource()`.
+  That method is the audit trail's human-readable identity and must stay
+  exact (`/etc/passwd`, not `/etc/`); the scope key deliberately loses
+  precision to group. Two different contracts, so a second function, placed
+  in `engine` next to the action types it switches on. Applied once at
+  ingest into a new `audit_events.scope_key` column so the profile query
+  and the Phase 4 `EXCEPT` query group on the same stored value.
+- **`tool_catalog` table + `Store.ListToolCatalog`.** Closest: storing the
+  description on the audit event's `action` JSON (which also happens, once).
+  Phase 4 needs "every tool this tenant has, with its description and verb"
+  as a lookup keyed by tool, which a scan over event JSON cannot serve. It
+  is the one tool table: Phase 4 ALTERs verb columns onto it.
+- **`store.MetricsFilter`, `store.VersionSummary`.** Parameter/result
+  shapes for the extended `Metrics`; not behavior.
+- **`Guard._remember_description` / `rememberDescription`,
+  `_git_head_version` / `gitHeadVersion`, `_tool_fingerprint` /
+  `toolFingerprint`.** Private helpers in the two SDKs with no prior
+  equivalent (nothing read `.git` or hashed the tool set before). Each has
+  exactly one definition per language.
+- **`GET /api/tools` → `handleListTools`.** Closest: `handleListAgents`
+  (same shape, different table). A list endpoint per table is the existing
+  convention in `webapi.go`.
+- **`components/RankList.tsx`, `components/StatCard.tsx`.** Moves, not
+  additions.
+- **Private helpers added while landing** (each one definition): store
+  `observeTool`, `queueToolCatalogUpserts`, `eventsPerHour`; proxy
+  `rememberDescriptions`, `descriptionFor`; Python `_tool_signature`,
+  `_with_description`, `_git_version_from_sha`; TS `withDescription`,
+  `rememberTool`, `gitVersionFromSha`; frontend `AgentDetailPanel`,
+  `DeltaRow`, `shortVersion`, `fmt`, `rate` inside `AgentsPage.tsx`.
+- **One thing removed rather than added:** the proxy briefly had its own
+  `truncateBytes` for descriptions; it duplicated `daemon.truncateUTF8`,
+  so the cap moved into `daemon.Decide` (one place, every enforcement
+  point) and the proxy helper was deleted before the phase closed.
+- **`Guard(auto_version=)` / `autoVersion`** is a constructor option, not a
+  parallel code path: with it off the version resolution simply stops
+  after the environment variable, as before this phase.
+
+### Deferred / known gaps
+
+- **Prompt-only changes are invisible to the `tools:` fingerprint**, and a
+  dirty working tree still reports the last commit under `git:`. Both are
+  stated in the SDK docs; explicit versions remain the recommendation for
+  deploys.
+- **The tools fingerprint is over the tools wrapped before the first
+  decision.** Tools wrapped later in the process do not change it (a
+  version must be stable for a run). TS signatures use arity, not
+  parameter names (JavaScript has no parameter introspection), so two TS
+  tools that differ only in parameter names fingerprint the same.
+- **`tool_catalog` is per tenant, not per agent.** Two agents in one
+  tenant with a `lookup` tool that means different things share one row;
+  the last description written wins. Per-agent catalogs would be one more
+  key column if that ever matters.
+- **Descriptions are sent once per process**, so a long-lived agent that
+  changes a tool's description without restarting never re-sends it. The
+  catalog also only learns tools from the SDKs and the MCP proxy;
+  `check_and_execute` / `checkAndExecute` and the OpenAI/Anthropic
+  dispatch adapters see a call, not a definition, and send none.
+- **`scope_key` is not backfilled** for rows ingested before this phase
+  (the dev database is the only one that exists); those rows group by raw
+  resource via the `COALESCE` fallback.
+- **`Versions` ignores the time filter by design**, so the selector can
+  list old versions; the per-version stats next to it do honor the
+  filter. The panel makes two metrics calls (current + previous version)
+  and one tool-catalog call every 20 s while open.
+- **No per-run features yet** (calls per run, repeats within a run); they
+  are Phase 4's volume kind and will be one more `GROUP BY run_id` in
+  `Metrics`.
+- **The Fleet table is wide** (seven columns plus a 460 px panel); below
+  ~1200 px the existing responsive rule stacks the panel under the table.
+
+### Verification run at this milestone
+
+- `gofmt -l .` — clean. `go vet ./...` — clean.
+- `go test -race -p 1 ./...` — all 10 packages with tests pass (engine
+  1.4 s, daemon 2.6 s, proxy/mcp 1.6 s, cli 1.5 s, forwarder 5.2 s, store
+  15.6 s, server 10.9 s). New: `engine TestScopeKey` (15 cases, one of
+  which caught a wrong expectation in the test — `/etc/passwd` groups
+  under `/etc/`, not `/`), `store TestMetrics` (rewritten: two versions,
+  outcomes, exec percentiles, scope-key grouping, version list ordering,
+  open vs. closed time spans, empty result), `store TestToolCatalogUpsert`,
+  `TestTenantIsolation` (extended: tool catalog and per-agent metrics are
+  tenant-scoped), `server TestMetricsPerAgentVersionAndToolCatalog`,
+  `mcp TestProxyAttachesToolDescriptionOnce`.
+- `cd sdk-python && pytest -q` — **54 passed** (was 47). `pyflakes
+  agentguard tests` — clean. New: description-once, function-decorator and
+  LangChain-shape descriptions, description cap, git HEAD (loose ref),
+  packed-refs, tools fingerprint (frozen at first decision, order-
+  independent, set-sensitive), explicit-wins.
+- `cd sdk-ts && npm test` — **42 passed** (was 37). Same five scenarios.
+- `cd dashboard/web && npm run build` — clean; `npm run lint` — 5
+  warnings, all pre-existing patterns (the one this phase introduced, an
+  exported non-component from a page file, was fixed before closing).
+- `examples/openai-coding-agent`: `pytest tests/` against a real daemon —
+  13 passed in 40 s (the example now runs under an automatic `git:`
+  version with no change to its code).
+- **End-to-end smoke** (script in the session scratchpad): built
+  `agentctl`, `agentguard-cloud`, `agentguard-forwarder`; signed up,
+  created and registered an agent; started a daemon; ran a Python agent
+  twice — version 1.0 with two read tools, version 1.1 adding a write tool
+  and a policy-denied delete — then `agentguard-forwarder -once`. Results
+  from the Web API: Fleet row shows version `1.1` and the policy hash;
+  `/api/metrics?agent_id=…&agent_version=1.0` → 12 events, 0 denies, 12
+  reported, p50 6 ms, 2 distinct resources; `…=1.1` → 18 events, 1 deny,
+  17 reported, p50 11 ms, 4 distinct resources, footprint listing the two
+  new tools; `versions` = `[1.1 (18), 1.0 (12)]` from both calls;
+  `/api/tools` → four rows, each with its docstring and argument names;
+  the daemon's audit log carried each description exactly once per
+  process. Two script mistakes on the way (a Unix socket path over
+  macOS's 104-byte limit; the daemon flag is `--audit`, not
+  `--audit-log`) were in the script, not the product.
+- Guardrail grep: every new Go/Python/TS/TSX symbol above has exactly one
+  definition (`rememberDescription` 1 definition + 2 call sites).
+
+## Rules-free anomaly detection, tool verb classification, and tenant-configurable thresholds (plan Phase 4)
+
+### Why
+
+Phase 3 gave every agent a per-version profile — what it does, and how
+that compares to its own previous version — but a human still has to open
+the Fleet page and notice a change. Surfacing behavioral deviations without
+anyone writing a detection rule was the other differentiator flagged in
+the competitive review. This phase adds that on top of the Phase 3 profile data,
+using the two inputs Phase 3 laid down for it: `scope_key` for a stable
+resource-grouping key, and tool descriptions for a one-time verb
+classification.
+
+Design agreed with the user before this phase started (recorded in the
+plan file, "Decisions taken" #14/#16 and the revised Phase 4 section):
+classification is LLM-based (a one-time job per tool, not per event) with
+a heuristic fallback so a missing API key never blocks anything; baselines
+are automatic and rolling, derived from the customer's own history, never
+hand-defined and never cross-tenant; thresholds are tenant-configurable
+from day one via one `tenant_settings` table and one Settings page; the
+four deviation kinds are named **system**, **operation**, **scope**, and
+**volume** to match the vocabulary the product is being compared against.
+
+### What changed
+
+**Verb classification.** `engine.HeuristicVerb(actionType, resource)`
+(`engine/verb.go`) resolves every built-in action type deterministically
+(fs_read → read, fs_write → write, secret_env → permission, network by
+HTTP method, shell by a short list of common program names) and scores an
+mcp_tool/function name by keyword (delete/remove/... → delete, grant/
+permission/... → permission, write/create/update/... → write, read/get/
+list/... → read); anything it can't read confidently is `unknown` rather
+than guessed. `tool_catalog` gained `verb`, `verb_reason`,
+`verb_confidence`, `verb_source` (`llm`/`heuristic`/`user`), and
+`classified_at`. `server.toolClassifier` (`dashboard/server/classifier.go`)
+calls the Anthropic Messages API directly over `net/http` — the one place
+this codebase talks to an LLM, and the sanctioned zero-dependency
+exception since it runs only in the cloud binary — for every catalog row
+with `verb_source = ''`; on any failure, or with no `ANTHROPIC_API_KEY`
+configured, it falls back to `engine.HeuristicVerb`. A row an admin sets
+via the new `PUT /api/tools/verb` (`verb_source = 'user'`) is never
+selected for re-classification.
+
+**Anomaly detection.** `server.anomalyRunner` (`dashboard/server/anomaly.go`)
+runs after every ingest, throttled to once per agent per 60s
+(`anomalyRunner.maybeRun`, called from `handleIngestEvents` after it
+re-fetches the agent so detection sees the version the batch just
+advanced to, not the one resolved from the API key before the batch was
+inserted). The window is the current hour (or however many minutes the
+tenant configures), aligned to the hour so re-running detection within it
+upserts the same rows. The baseline is the same version's own prior
+`baseline_hours` if that's ≥ `min_baseline_events`, else the previous
+version's own last `baseline_hours` of activity (its own lifetime, not the
+same clock window — a retired version's "recent" history is whenever it
+was last used), else detection skips entirely for that agent this run
+(`anomalyRunner.resolveBaseline`) — nobody hand-defines a baseline, and it
+never crosses tenants because it is always computed from `store.Metrics`
+scoped to the one agent. Four kinds, each a row in the new `anomalies`
+table:
+- **system** — new scope keys (via the new `store.NewScopeKeys`, a
+  set-difference query), capped at 25 per run; plus elevated error rate
+  and elevated p50 execution time.
+- **operation** — a shift in the read/write/delete/permission share of
+  calls (via the new `store.VerbCounts`, which classifies mcp_tool/
+  function calls through the tool catalog and everything else through
+  `engine.HeuristicVerb` directly — built-ins are never cataloged, so they
+  are never classified any other way); plus an elevated deny rate.
+- **scope** — a single reported call whose output size is far above the
+  baseline's 95th percentile for that scope key (via the new
+  `store.ScopeOutputStats`).
+- **volume** — an elevated overall call rate (from `store.Metrics`'
+  existing `EventsPerHour`); plus an elevated average calls-per-run (via
+  the new `store.RunEventCounts`, a thin wrapper over the existing `topN`).
+
+Every ratio/rate comparison goes through one function,
+`server.ratioAnomaly`, so "how much bigger than the baseline is enough" is
+answered the same way in all four kinds; every rate goes through
+`server.rateOf` so a zero denominator is 0, not NaN. `anomalies` is keyed
+`UNIQUE (agent_id, kind, key, window_start)`, so `store.UpsertAnomaly`
+updates a still-open row in place rather than duplicating it (it does not,
+however, delete a row for a deviation that stops reproducing — see gaps).
+
+**Tenant settings.** New `tenant_settings` table (one row per tenant),
+`store.TenantSettings` + `DefaultTenantSettings` (the one place the
+numbers are named) + `Get/PutTenantSettings` + `(TenantSettings) Validate`,
+`GET/PUT /api/settings` (viewer/admin), and `SettingsPage.tsx` — thresholds
+in one form, plus a table of every cataloged tool with its verb, source,
+and (admin) an override dropdown. New nav group "Configuration" in
+`Sidebar.tsx`/`Header.tsx`/`App.tsx`.
+
+**Anomalies UI.** `components/AnomalyList.tsx` (new, shared) renders in two
+places: a third panel on `OverviewPage` (tenant-wide, unacknowledged,
+newest first, with Ack for admins) and inside the Fleet page's
+`AgentDetailPanel` (scoped to that agent). Both call the same
+`api.ackAnomaly`.
+
+### Guardrail: why new code
+
+- **`engine/verb.go`, `dashboard/server/classifier.go`,
+  `dashboard/server/anomaly.go`.** No verb notion, no LLM caller, and no
+  detector existed before this phase; each is the one definition its
+  registry row now names.
+- **`store.VerbCounts`, `RunEventCounts`, `ScopeOutputStats`,
+  `NewScopeKeys`.** The closest existing symbol is `store.Metrics` (the
+  one aggregation function) and its private `topN` helper. `RunEventCounts`
+  and `VerbCounts` are thin wrappers *over* `topN` — grouped by `run_id`,
+  and by a composite `action_type`+`resource` expression respectively —
+  not new SQL. `ScopeOutputStats` needs two aggregates (`max` and
+  `percentile_cont`) per group, a shape `topN`'s single-count design
+  can't express without becoming a much more general (and unused-elsewhere)
+  function. `NewScopeKeys` needs a set-difference (`NOT IN` over a second
+  filtered scan), which no counting/grouping function can express at all.
+  All four take a `store.MetricsFilter` (or the same explicit
+  window/baseline parameters `Metrics` uses) rather than inventing a
+  second filter shape.
+- **`store.GetAgent`.** Closest: `AgentFromAPIKey` (resolves by key, not
+  id) and `ListAgents` (every agent in a tenant, not one fresh row). The
+  ingest handler needs exactly one fresh row right after `InsertEvents`
+  may have just advanced its `last_agent_version`.
+- **`tenant_settings`, `anomalies` tables; `store.TenantSettings`,
+  `store.Anomaly`, `store.AnomalyFilter`, `store.ScopeOutputStat`.** Named
+  in the plan as the one settings table and the one anomalies table before
+  any code was written; `docs/conventions.md`'s forbidden list already
+  named "a second tenant-settings table" and "a second tool table"
+  specifically to head this off.
+- **`PUT /api/tools/verb`, `GET/POST /api/anomalies*`, `GET/PUT
+  /api/settings`.** Closest: `handleSetToolVerb` extends the existing
+  `tool_catalog` row (`SetToolVerb`, one writer of those columns, next to
+  `ListToolCatalog` in the same file); the anomaly/settings handlers are
+  one-list-one-write-one-ack, following the same shape as
+  `handleListPending`/`handleResolvePending`.
+- **`components/AnomalyList.tsx`, `pages/SettingsPage.tsx`.** No anomaly
+  rendering or settings UI existed. `AnomalyList` is shared rather than
+  written twice into `OverviewPage.tsx` and `AgentsPage.tsx`.
+- **Private helpers added while landing** (each one definition):
+  `verbFor` (store, shared by `VerbCounts`), `metricsWhere` (extracted out
+  of `Metrics` so the four new aggregates build the same WHERE clause
+  rather than a second copy — a refactor, not new logic), `sumVerbs`,
+  `avgCount`, `rateOf`, `ratioAnomaly`, `parseClassifierResponse`
+  (isolated so the classifier's JSON parsing has a test that never
+  touches the network), `describeAnomaly` (frontend, inside
+  `AnomalyList.tsx`).
+
+### Deferred / known gaps
+
+- **Detection runs synchronously inside the ingest request**, bounded by a
+  5s context, rather than in a background worker. The plan called for a
+  `sync.Map` throttle either way; running synchronously avoided adding any
+  new concurrency machinery (no ticker, no queue) and made every new test
+  deterministic (no sleeping to wait for a goroutine). The cost is added
+  ingest latency roughly once a minute per agent, bounded by the 5s
+  timeout. A future move to a background worker would not change the
+  detector's logic, only who calls `maybeRun`.
+- **A settings-cache-per-tenant-for-60s micro-optimization from the plan
+  was skipped.** Detection already runs at most once per agent per minute,
+  which already bounds `GetTenantSettings` to that same rate; caching on
+  top of an already-throttled call has no material benefit here.
+- **`UpsertAnomaly` never deletes a stale row.** A deviation that stops
+  reproducing in a later run of the *same* window stays reported; only a
+  human acknowledging it, or the window rolling forward, moves past it.
+  Documented, not fixed — the plan's `anomalies` schema has no soft-delete
+  or "still active" column, and adding one is a bigger decision than this
+  phase should make unasked.
+- **Scope kind's argument-shape check (single id → list/wildcard) was not
+  built.** Only the bulk-output-size check shipped. Detecting a shape
+  change generically (across every tool's differently-shaped arguments)
+  needs a real design, not a rushed one; recorded here rather than shipped
+  half-working.
+- **Warm-up starvation is real and untouched.** An agent version with
+  fewer than `min_baseline_events` and no usable previous version simply
+  never gets checked. No partial/low-confidence detection was added.
+- **No feedback from acknowledgement.** Acking a system/operation/scope/
+  volume anomaly stops it showing as unacknowledged; it does not raise
+  that agent's threshold, silence that specific key, or otherwise change
+  future detection. Every one of these was already listed as deferred in
+  the plan before this phase started.
+- **The classifier prompt and its parsing were exercised via the
+  heuristic-fallback path in every automated test** (no `ANTHROPIC_API_KEY`
+  in the test/dev environment); `parseClassifierResponse` has direct unit
+  coverage for the response-parsing/validation logic, but the live
+  Messages API call itself is untested here — a real key would be needed,
+  and this repo has none checked in (nor should it).
+- **Fixed ratios, not statistical scoring.** A tenant sees the same
+  `volume_ratio`/`share_shift`/etc. thresholds until they change them by
+  hand; there is no auto-tuning from false-positive/negative feedback.
+  Named as a size/risk item in the plan, not attempted here.
+
+### Verification run at this milestone
+
+- `gofmt -l .` — clean. `go vet ./...` — clean.
+- `go test -race -p 1 ./...` — all packages with tests pass (engine,
+  daemon, proxy/mcp, proxy/network, cli, forwarder, approval, hardened,
+  store 16.6s, server 19.6s). New: `engine TestHeuristicVerb` (20 cases);
+  `store TestTenantSettingsDefaultsAndRoundTrip`, `TestTenantIsolation`
+  (extended: tenant settings and anomalies are tenant-scoped, including
+  that acknowledging under the wrong tenant is `ErrNotFound`); `server
+  TestDetectAnomaliesAllKinds` (one scenario triggering all four kinds
+  plus their sub-checks, and confirming a second detection pass on the
+  same window upserts rather than duplicates), `TestDetectAnomaliesFallsBackToPreviousVersion`,
+  `TestDetectAnomaliesHonorsTenantThresholds` (the same mild share shift
+  flagged under default thresholds and not under a stricter one, run in
+  that order on the same window so no upserted row is left over to
+  confuse the assertion), `TestSettingsPutRequiresAdmin` (defaults, save,
+  round-trip, foreign-tenant 403, validation 400), `TestIngestTriggersAnomalyDetection`
+  (a real `POST /v1/events` call triggers detection synchronously, visible
+  in `GET /api/anomalies` immediately after), `TestParseClassifierResponse`
+  (5 cases, no network), `TestToolClassifierHeuristicFallbackAndUserOverride`.
+- `cd dashboard/web && npm run build` — clean; `npm run lint` — the same 5
+  pre-existing warnings as Phase 3, none new.
+- **End-to-end smoke** against a real running `agentguard-cloud` +
+  Postgres (not just the test suite): signed up, created and registered
+  an agent, shipped 62 events over HTTP exactly as a forwarder would (a
+  41+9-event baseline plus a window with a new directory, a write burst,
+  and a new `function` tool). `GET /api/anomalies` returned all five
+  expected rows in one detection pass (`volume/events_per_hour`,
+  `operation/write`, `operation/read`, `system/function:delete_customer`,
+  `system/fs_read:/newdir/`) with correct baseline versions/windows;
+  `GET /api/tools` showed `delete_customer` classified `delete` via
+  `heuristic fallback (no classifier key configured...)`; `PUT
+  /api/tools/verb` then `GET /api/tools` confirmed the override persisted
+  as `verb_source: user`; `POST /api/anomalies/ack` dropped the
+  unacknowledged count from 5 to 4; `PUT /api/settings` then `GET
+  /api/settings` round-tripped a changed `window_minutes`.
+- Guardrail grep: every new Go/TS/TSX symbol above has exactly one
+  non-test definition.
+
+## Switch the tool classifier's LLM provider to OpenAI, and load local secrets from a `.env` file
+
+### Why
+
+The Phase 4 tool classifier (`dashboard/server/classifier.go`) called
+Anthropic's Messages API. The user has an OpenAI key available for this
+project and asked to use OpenAI instead, with the key supplied via a
+`.env` file rather than an exported shell variable.
+
+### What changed
+
+`classifier.go`'s `askLLM` now calls OpenAI's Chat Completions API
+(`https://api.openai.com/v1/chat/completions`) with `response_format:
+{"type":"json_object"}` to match the prompt's "JSON only" instruction,
+reading `OPENAI_API_KEY` instead of `ANTHROPIC_API_KEY` and defaulting
+`AGENTGUARD_CLASSIFIER_MODEL` to `gpt-4o-mini` (the same default model the
+`examples/openai-coding-agent` demo already uses, so this repo doesn't
+name two different "cheap OpenAI default" models). `parseClassifierResponse`
+did not change — it was already provider-agnostic (it parses a JSON blob
+out of a text response, not the whole envelope). `verb_source: "llm"`
+likewise did not change — it was never provider-specific.
+
+New `loadDotEnv` in `cmd/agentguard-cloud/main.go`, called at the top of
+`run()`: reads `KEY=VALUE` lines from a `.env` file in the working
+directory (`os.ReadFile`, `strings.Cut` on `=`, quotes trimmed) and
+`os.Setenv`s any key not already present in the real environment — a real
+exported var always wins. Missing file is a no-op, not an error. New
+`.env` at the repo root (gitignored — the existing `.env` pattern in
+`.gitignore` already covers it) with `OPENAI_API_KEY=` left blank for the
+user to fill in, and a commented-out `AGENTGUARD_CLASSIFIER_MODEL`.
+
+### Guardrail: why new code
+
+- **`askLLM`, `defaultClassifierModel`, the `OPENAI_API_KEY` read.** Not
+  new symbols — the same one classifier's one LLM-calling method, edited
+  in place; no second classifier was written alongside it.
+- **`loadDotEnv`.** No environment-file loader existed anywhere in this
+  repo (the Python example agent's `.env` is read by `python-dotenv`, a
+  dependency of that example only, not by any code in this codebase).
+  Closest candidate to extend: none. Deliberately minimal (no quoting
+  edge cases beyond a single trim, no `export` keyword, no multiline
+  values) rather than adding a dotenv dependency to the cloud binary for a
+  handful of optional local-dev keys — consistent with the zero-unnecessary-
+  dependency principle applied everywhere else in this codebase.
+
+### Deferred / known gaps
+
+- The live OpenAI call itself is still untested in this environment: the
+  user has not yet filled in `OPENAI_API_KEY` in the new `.env`, so the
+  classifier continues to run through `engine.HeuristicVerb`'s fallback
+  path, exactly as it did with the Anthropic integration. Once a key is
+  added, the classifier will start calling OpenAI on the next tool
+  seen with `verb_source = ''` — no restart-triggered backfill of
+  already-heuristically-classified rows (those keep their `verb_source =
+  'heuristic'` value until a human overrides them; re-classifying
+  everything on every provider change was judged out of scope here).
+- `loadDotEnv` only looks in the process's current working directory
+  (`.env`, relative), matching how the binary has been run in this
+  project so far (from the repo root). It does not search parent
+  directories or accept a `--env-file` flag.
+
+### Verification run at this milestone
+
+- `gofmt -l .` — clean. `go vet ./...` — clean.
+- `go test -race -p 1 ./...` — all packages pass, including the existing
+  `dashboard/server` classifier/anomaly tests (unaffected — they exercise
+  the provider-agnostic heuristic-fallback and parsing paths) and three
+  new `cmd/agentguard-cloud` tests: `TestLoadDotEnv` (sets unset vars,
+  trims double and single quotes, skips comments/blank lines/malformed
+  lines), `TestLoadDotEnvNeverOverridesARealEnvVar`, `TestLoadDotEnvMissingFileIsANoOp`.
+- Guardrail grep: `askLLM`, `loadDotEnv` each have exactly one definition.

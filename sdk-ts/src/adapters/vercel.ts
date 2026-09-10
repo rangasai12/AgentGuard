@@ -5,10 +5,10 @@
  * an `execute` function rather than `.name`. No dependency on the `ai`
  * package.
  */
-import { PolicyDenied } from "../exceptions.ts";
 import type { Guard } from "../guard.ts";
 
 interface VercelToolLike {
+  description?: unknown;
   execute?: (args: unknown, options?: unknown) => unknown;
   [key: string]: unknown;
 }
@@ -25,15 +25,13 @@ export function wrapTools<T extends Record<string, VercelToolLike>>(guard: Guard
       continue;
     }
     const original = tool.execute;
+    guard.rememberDescription(name, tool.description);
     wrapped[name] = {
       ...tool,
-      execute: async (args: unknown, options?: unknown) => {
-        const decision = await guard.check(name);
-        if (decision.result !== "allow") {
-          throw new PolicyDenied(name, decision);
-        }
-        return original(args, options);
-      },
+      // Route through the Guard's one check-then-execute primitive so this
+      // adapter gets argument capture and outcome reporting for free
+      // instead of re-implementing the check-and-deny step.
+      execute: (args: unknown, options?: unknown) => guard.checkAndExecute(name, args, (a) => original(a, options)),
     };
   }
 

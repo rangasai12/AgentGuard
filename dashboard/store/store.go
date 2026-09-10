@@ -62,6 +62,6 @@ func (s *Store) Close() {
 // test from a clean database too, without either package reaching into the
 // other's unexported fields.
 func (s *Store) ResetForTests(ctx context.Context) error {
-	_, err := s.pool.Exec(ctx, `TRUNCATE pending_approvals, audit_events, sessions, memberships, agents, users, tenants CASCADE`)
+	_, err := s.pool.Exec(ctx, `TRUNCATE anomalies, tenant_settings, tool_catalog, pending_approvals, audit_events, sessions, memberships, agents, users, tenants CASCADE`)
 	return err
 }

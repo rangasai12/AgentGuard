@@ -71,7 +71,7 @@ func startTestDaemonForCLI(t *testing.T) (socketPath string, d *daemon.Daemon) {
 
 func TestRunAuditTailAgainstLiveDaemon(t *testing.T) {
 	socketPath, d := startTestDaemonForCLI(t)
-	d.Evaluate("agent-1", engine.Action{Type: engine.ActionShell, Command: "git status"})
+	d.Evaluate(daemon.DecisionRequest{Actor: "agent-1", Action: engine.Action{Type: engine.ActionShell, Command: "git status"}})
 
 	var stdout, stderr bytes.Buffer
 	code := runAudit([]string{"tail", "-socket", socketPath, "-n", "10"}, &stdout, &stderr)
@@ -85,8 +85,8 @@ func TestRunAuditTailAgainstLiveDaemon(t *testing.T) {
 
 func TestRunAuditQueryFilterByDecision(t *testing.T) {
 	socketPath, d := startTestDaemonForCLI(t)
-	d.Evaluate("agent-1", engine.Action{Type: engine.ActionShell, Command: "git status"})
-	d.Evaluate("agent-1", engine.Action{Type: engine.ActionShell, Command: "curl evil.com"})
+	d.Evaluate(daemon.DecisionRequest{Actor: "agent-1", Action: engine.Action{Type: engine.ActionShell, Command: "git status"}})
+	d.Evaluate(daemon.DecisionRequest{Actor: "agent-1", Action: engine.Action{Type: engine.ActionShell, Command: "curl evil.com"}})
 
 	var stdout, stderr bytes.Buffer
 	code := runAudit([]string{"query", "-socket", socketPath, "-decision", "deny"}, &stdout, &stderr)
@@ -106,7 +106,7 @@ func TestRunApproveAgainstLiveDaemon(t *testing.T) {
 
 	resultCh := make(chan daemon.EvaluateResult, 1)
 	go func() {
-		resultCh <- d.Evaluate("agent-1", engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"})
+		resultCh <- d.Evaluate(daemon.DecisionRequest{Actor: "agent-1", Action: engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"}})
 	}()
 
 	var approvalID string
@@ -149,7 +149,7 @@ func TestRunPendingListsAndPassesIDsApproveAccepts(t *testing.T) {
 
 	resultCh := make(chan daemon.EvaluateResult, 1)
 	go func() {
-		resultCh <- d.Evaluate("agent-1", engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"})
+		resultCh <- d.Evaluate(daemon.DecisionRequest{Actor: "agent-1", Action: engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"}})
 	}()
 
 	deadline := time.After(time.Second)

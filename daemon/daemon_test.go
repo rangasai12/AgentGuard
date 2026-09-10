@@ -41,13 +41,70 @@ func newTestDaemon(t *testing.T) *Daemon {
 
 func TestDaemonEvaluateAllowIsLogged(t *testing.T) {
 	d := newTestDaemon(t)
-	res := d.Evaluate("agent-1", engine.Action{Type: engine.ActionFSWrite, Path: "/workspace/main.go"})
+	res := d.Evaluate(DecisionRequest{Actor: "agent-1", RunID: "run-abc", AgentVersion: "1.2.3", Action: engine.Action{Type: engine.ActionFSWrite, Path: "/workspace/main.go"}})
 	if res.Decision.Result != engine.Allow {
 		t.Fatalf("expected Allow, got %s", res.Decision.Result)
 	}
 	events := d.Audit.Tail(10)
 	if len(events) != 1 || events[0].Decision != engine.Allow || events[0].Resource != "/workspace/main.go" {
 		t.Errorf("expected one Allow audit event for the write, got %+v", events)
+	}
+	ev := events[0]
+	if ev.EventID == "" || ev.EventID != res.EventID {
+		t.Errorf("expected the audit event to carry the same EventID Evaluate returned (%q), got %q", res.EventID, ev.EventID)
+	}
+	if ev.RunID != "run-abc" || ev.AgentVersion != "1.2.3" {
+		t.Errorf("expected run/version identity on the audit event, got run=%q version=%q", ev.RunID, ev.AgentVersion)
+	}
+	if ev.PolicyHash == "" || ev.PolicyHash != d.Policy().Hash {
+		t.Errorf("expected the audit event to carry the policy hash %q, got %q", d.Policy().Hash, ev.PolicyHash)
+	}
+	if ev.Action == nil || ev.Action.Path != "/workspace/main.go" || ev.Action.Type != engine.ActionFSWrite {
+		t.Errorf("expected the structured action on the audit event, got %+v", ev.Action)
+	}
+	if ev.Outcome != nil {
+		t.Errorf("a fresh decision must have no outcome yet, got %+v", ev.Outcome)
+	}
+}
+
+func TestRedactArgsAppliedBeforeAudit(t *testing.T) {
+	policy, err := engine.ParsePolicy([]byte(`
+version: 1
+functions:
+  default: deny
+  rules:
+    - name: login
+      allow: true
+      conditions:
+        - { arg: password, op: "=", value: "hunter2" }
+audit:
+  redact_args: [password]
+`))
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	audit := newTestAuditLogger(t)
+	d := New(policy, audit)
+
+	args := map[string]any{"user": "alice", "password": "hunter2"}
+	res := d.Evaluate(DecisionRequest{Actor: "agent-1", Action: engine.Action{Type: engine.ActionFunction, Name: "login", Args: args}})
+	// The condition must have seen the real password to allow the call...
+	if res.Decision.Result != engine.Allow {
+		t.Fatalf("expected the condition on the real argument value to allow, got %+v", res.Decision)
+	}
+	// ...while the audit log must not.
+	events := audit.Tail(1)
+	if len(events) != 1 || events[0].Action == nil {
+		t.Fatalf("expected one audit event with a structured action, got %+v", events)
+	}
+	if got := events[0].Action.Args["password"]; got != "[redacted]" {
+		t.Errorf("expected password to be redacted in the audit log, got %v", got)
+	}
+	if got := events[0].Action.Args["user"]; got != "alice" {
+		t.Errorf("expected non-listed args to be kept, got %v", got)
+	}
+	if args["password"] != "hunter2" {
+		t.Errorf("redaction must not mutate the caller's map, got %v", args["password"])
 	}
 }
 
@@ -56,7 +113,7 @@ func TestDaemonEvaluateRequireApprovalThenApprove(t *testing.T) {
 	action := engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"}
 
 	resultCh := make(chan EvaluateResult, 1)
-	go func() { resultCh <- d.Evaluate("agent-1", action) }()
+	go func() { resultCh <- d.Evaluate(DecisionRequest{Actor: "agent-1", Action: action}) }()
 
 	var approvalID string
 	deadline := time.After(time.Second)
@@ -98,7 +155,7 @@ func TestDaemonEvaluateRequireApprovalTimesOutToDeny(t *testing.T) {
 	d := newTestDaemon(t)
 	action := engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"}
 
-	res := d.Evaluate("agent-1", action) // policy's approval_timeout_seconds is 1
+	res := d.Evaluate(DecisionRequest{Actor: "agent-1", Action: action}) // policy's approval_timeout_seconds is 1
 	if res.Decision.Result != engine.Deny {
 		t.Fatalf("expected timeout to fall back to Deny, got %s", res.Decision.Result)
 	}
@@ -113,7 +170,7 @@ func TestDaemonDenyApproval(t *testing.T) {
 	action := engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"}
 
 	resultCh := make(chan EvaluateResult, 1)
-	go func() { resultCh <- d.Evaluate("agent-1", action) }()
+	go func() { resultCh <- d.Evaluate(DecisionRequest{Actor: "agent-1", Action: action}) }()
 
 	var approvalID string
 	deadline := time.After(time.Second)
@@ -140,7 +197,7 @@ func TestDaemonDenyApproval(t *testing.T) {
 
 func TestDaemonSetPolicyTakesEffectImmediately(t *testing.T) {
 	d := newTestDaemon(t)
-	before := d.Evaluate("agent-1", engine.Action{Type: engine.ActionFSWrite, Path: "/etc/passwd"})
+	before := d.Evaluate(DecisionRequest{Actor: "agent-1", Action: engine.Action{Type: engine.ActionFSWrite, Path: "/etc/passwd"}})
 	if before.Decision.Result != engine.Deny {
 		t.Fatalf("expected initial policy to deny, got %s", before.Decision.Result)
 	}
@@ -151,7 +208,7 @@ func TestDaemonSetPolicyTakesEffectImmediately(t *testing.T) {
 	}
 	d.SetPolicy(newPolicy)
 
-	after := d.Evaluate("agent-1", engine.Action{Type: engine.ActionFSWrite, Path: "/etc/passwd"})
+	after := d.Evaluate(DecisionRequest{Actor: "agent-1", Action: engine.Action{Type: engine.ActionFSWrite, Path: "/etc/passwd"}})
 	if after.Decision.Result != engine.Allow {
 		t.Fatalf("expected updated policy to allow, got %s", after.Decision.Result)
 	}

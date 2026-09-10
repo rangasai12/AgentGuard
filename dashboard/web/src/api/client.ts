@@ -1,10 +1,15 @@
 import type {
   Agent,
+  Anomaly,
+  AnomalyFilters,
   AuditEvent,
   EventFilters,
   Membership,
   Metrics,
+  MetricsFilters,
   PendingApproval,
+  TenantSettings,
+  ToolCatalogEntry,
   User,
 } from "./types";
 
@@ -88,8 +93,37 @@ export const api = {
       `/api/events${query({ tenant_id: tenantId, ...filters })}`,
     ),
 
-  metrics: (tenantId: string, since?: string, until?: string) =>
-    request<Metrics>(`/api/metrics${query({ tenant_id: tenantId, since, until })}`),
+  metrics: (tenantId: string, filters: MetricsFilters = {}) =>
+    request<Metrics>(`/api/metrics${query({ tenant_id: tenantId, ...filters })}`),
+
+  listTools: (tenantId: string) =>
+    request<{ tools: ToolCatalogEntry[] }>(`/api/tools${query({ tenant_id: tenantId })}`),
+
+  setToolVerb: (tenantId: string, actionType: string, resource: string, verb: string) =>
+    request<{ ok: boolean }>(`/api/tools/verb${query({ tenant_id: tenantId })}`, {
+      method: "PUT",
+      body: JSON.stringify({ action_type: actionType, resource, verb }),
+    }),
+
+  listAnomalies: (tenantId: string, filters: AnomalyFilters = {}) =>
+    request<{ anomalies: Anomaly[] }>(
+      `/api/anomalies${query({ tenant_id: tenantId, ...filters, unacknowledged: filters.unacknowledged ? "true" : undefined })}`,
+    ),
+
+  ackAnomaly: (tenantId: string, anomalyId: string) =>
+    request<{ ok: boolean }>(`/api/anomalies/ack${query({ tenant_id: tenantId })}`, {
+      method: "POST",
+      body: JSON.stringify({ anomaly_id: anomalyId }),
+    }),
+
+  getSettings: (tenantId: string) =>
+    request<TenantSettings>(`/api/settings${query({ tenant_id: tenantId })}`),
+
+  putSettings: (tenantId: string, settings: TenantSettings) =>
+    request<{ ok: boolean }>(`/api/settings${query({ tenant_id: tenantId })}`, {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
 
   listPending: (tenantId: string) =>
     request<{ pending: PendingApproval[] }>(`/api/pending${query({ tenant_id: tenantId })}`),

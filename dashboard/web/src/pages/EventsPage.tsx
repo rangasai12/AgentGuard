@@ -21,6 +21,11 @@ function downloadCsv(events: AuditEvent[]) {
     "matched_rule",
     "reason",
     "latency_ms",
+    "event_id",
+    "run_id",
+    "agent_version",
+    "outcome",
+    "exec_ms",
   ];
   const rows = events.map((e) => [
     e.timestamp,
@@ -32,6 +37,11 @@ function downloadCsv(events: AuditEvent[]) {
     e.matched_rule || "",
     e.reason || "",
     String(e.latency_ms ?? ""),
+    e.event_id || "",
+    e.run_id || "",
+    e.agent_version || "",
+    e.outcome?.status || "",
+    e.outcome ? String(e.outcome.exec_ms) : "",
   ]);
   const csv = [header, ...rows]
     .map((row) => row.map((cell) => `"${String(cell).replace(/"/g, '""')}"`).join(","))
@@ -230,6 +240,7 @@ export function EventsPage() {
                     <th>Action type</th>
                     <th>Resource</th>
                     <th>Decision</th>
+                    <th>Outcome</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -264,6 +275,16 @@ export function EventsPage() {
                       </td>
                       <td>
                         <DecisionBadge decision={event.decision} />
+                      </td>
+                      <td>
+                        {event.outcome ? (
+                          <span className="name-cell" title={`${event.outcome.exec_ms} ms`}>
+                            <DecisionBadge decision={event.outcome.status} />
+                            <span className="muted">{event.outcome.exec_ms} ms</span>
+                          </span>
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -329,8 +350,33 @@ export function EventsPage() {
                           <dd>{selectedEvent.action_type}</dd>
                         </div>
                         <div>
-                          <dt>Latency</dt>
-                          <dd>{selectedEvent.latency_ms} ms</dd>
+                          <dt>Decision latency</dt>
+                          <dd title="Policy evaluation plus any approval wait">{selectedEvent.latency_ms} ms</dd>
+                        </div>
+                        <div>
+                          <dt>Run</dt>
+                          <dd className="mono">{selectedEvent.run_id || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Agent version</dt>
+                          <dd>{selectedEvent.agent_version || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Policy</dt>
+                          <dd className="mono">{selectedEvent.policy_hash || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Outcome</dt>
+                          <dd>
+                            {selectedEvent.outcome ? (
+                              <span className="name-cell">
+                                <DecisionBadge decision={selectedEvent.outcome.status} />
+                                <span className="muted">{selectedEvent.outcome.exec_ms} ms</span>
+                              </span>
+                            ) : (
+                              "not reported"
+                            )}
+                          </dd>
                         </div>
                       </dl>
 
@@ -371,6 +417,38 @@ export function EventsPage() {
                             <dt>Reason</dt>
                             <dd>{selectedEvent.reason || "—"}</dd>
                           </div>
+                          {selectedEvent.action?.args && Object.keys(selectedEvent.action.args).length > 0 && (
+                            <div style={{ gridColumn: "1 / -1" }}>
+                              <dt>Arguments</dt>
+                              <dd>
+                                <div className="code-block">
+                                  <pre>{JSON.stringify(selectedEvent.action.args, null, 2)}</pre>
+                                </div>
+                              </dd>
+                            </div>
+                          )}
+                          {selectedEvent.outcome?.error && (
+                            <div style={{ gridColumn: "1 / -1" }}>
+                              <dt>Error</dt>
+                              <dd className="mono">{selectedEvent.outcome.error}</dd>
+                            </div>
+                          )}
+                          {selectedEvent.outcome?.output && (
+                            <div style={{ gridColumn: "1 / -1" }}>
+                              <dt>
+                                Output
+                                {selectedEvent.outcome.output_bytes &&
+                                selectedEvent.outcome.output_bytes > selectedEvent.outcome.output.length
+                                  ? ` (first ${selectedEvent.outcome.output.length} of ${selectedEvent.outcome.output_bytes} bytes)`
+                                  : ""}
+                              </dt>
+                              <dd>
+                                <div className="code-block">
+                                  <pre>{selectedEvent.outcome.output}</pre>
+                                </div>
+                              </dd>
+                            </div>
+                          )}
                         </dl>
                       ) : (
                         <div className="code-block">

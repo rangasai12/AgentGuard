@@ -19,8 +19,15 @@ type Request struct {
 	Actor  string        `json:"actor,omitempty"`
 	Action engine.Action `json:"action,omitempty"`
 	N      int           `json:"n,omitempty"`
-	ID     string        `json:"id,omitempty"`
+	ID     string        `json:"id,omitempty"` // approval id for approve/deny; event id for report
 	Filter AuditFilter   `json:"filter,omitempty"`
+
+	// RunID and AgentVersion tag an evaluate request with the execution and
+	// agent build it belongs to (see DecisionRequest).
+	RunID        string `json:"run_id,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty"`
+	// Outcome is the payload of a report request.
+	Outcome *Outcome `json:"outcome,omitempty"`
 }
 
 // Response is the daemon's line-delimited JSON reply to one Request.
@@ -30,6 +37,7 @@ type Response struct {
 	Decision   *engine.Decision  `json:"decision,omitempty"`
 	ApprovalID string            `json:"approval_id,omitempty"`
 	LatencyMS  int64             `json:"latency_ms,omitempty"`
+	EventID    string            `json:"event_id,omitempty"` // for evaluate: pass back to report
 	Events     []AuditEvent      `json:"events,omitempty"`
 	Pending    []PendingApproval `json:"pending,omitempty"`
 }
@@ -91,8 +99,20 @@ func dispatch(d *Daemon, req Request) Response {
 		return Response{OK: true}
 
 	case "evaluate":
-		result := d.Evaluate(req.Actor, req.Action)
-		return Response{OK: true, Decision: &result.Decision, ApprovalID: result.ApprovalID, LatencyMS: result.LatencyMS}
+		result := d.Evaluate(DecisionRequest{Actor: req.Actor, RunID: req.RunID, AgentVersion: req.AgentVersion, Action: req.Action})
+		return Response{OK: true, Decision: &result.Decision, ApprovalID: result.ApprovalID, LatencyMS: result.LatencyMS, EventID: result.EventID}
+
+	case "report":
+		if req.ID == "" {
+			return errResponse(errors.New("report requires an id (the event_id returned by evaluate)"))
+		}
+		if req.Outcome == nil {
+			return errResponse(errors.New("report requires an outcome"))
+		}
+		if err := d.Audit.Report(req.ID, *req.Outcome); err != nil {
+			return errResponse(err)
+		}
+		return Response{OK: true}
 
 	case "audit_tail":
 		return Response{OK: true, Events: d.Audit.Tail(req.N)}

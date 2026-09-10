@@ -85,20 +85,35 @@ def fake_daemon():
         d.stop()
 
 
-def decision_handler(decisions: Dict[str, dict]):
+def decision_handler(decisions: Dict[str, dict], reject_reports: bool = False):
     """Builds a handler that answers `evaluate` requests by looking up the
     action's tool name in `decisions` (defaulting to deny for anything
-    unlisted, matching the real engine's default-deny posture), and answers
-    `ping` unconditionally.
+    unlisted, matching the real engine's default-deny posture), answers
+    `ping` unconditionally, and accepts `report` requests, recording each
+    on `handle.reports` (and every evaluate request on `handle.evaluates`)
+    so tests can assert on what the SDK sent. Every evaluate answer carries
+    an `event_id` the way the real daemon's does; `reject_reports` makes
+    `report` answer `{"ok": False}` to test that a failed report never
+    affects the tool call.
     """
+    reports: List[dict] = []
+    evaluates: List[dict] = []
 
     def handle(req: dict) -> dict:
         if req.get("cmd") == "ping":
             return {"ok": True}
         if req.get("cmd") == "evaluate":
+            evaluates.append(req)
             tool = req.get("action", {}).get("tool")
             decision = decisions.get(tool, {"result": "deny", "matched_rule": "default-deny"})
-            return {"ok": True, "decision": decision}
+            return {"ok": True, "decision": decision, "event_id": f"{len(evaluates):016x}"}
+        if req.get("cmd") == "report":
+            reports.append(req)
+            if reject_reports:
+                return {"ok": False, "error": "fake daemon: reports rejected"}
+            return {"ok": True}
         return {"ok": False, "error": f"fake daemon: unhandled cmd {req.get('cmd')!r}"}
 
+    handle.reports = reports  # type: ignore[attr-defined]
+    handle.evaluates = evaluates  # type: ignore[attr-defined]
     return handle

@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -14,8 +16,9 @@ import (
 // body — so a forwarder can only ever act as the one agent its key was
 // issued for.
 func registerControlAPI(mux *http.ServeMux, s *store.Store) {
+	runner := newAnomalyRunner(s, newToolClassifier())
 	mux.HandleFunc("POST /v1/agents/register", handleRegisterAgent(s))
-	mux.HandleFunc("POST /v1/events", withAgentAuth(s, handleIngestEvents(s)))
+	mux.HandleFunc("POST /v1/events", withAgentAuth(s, handleIngestEvents(s, runner)))
 	mux.HandleFunc("POST /v1/pending/sync", withAgentAuth(s, handleSyncPending(s)))
 	mux.HandleFunc("GET /v1/pending/resolutions", withAgentAuth(s, handlePendingResolutions(s)))
 	mux.HandleFunc("POST /v1/pending/ack", withAgentAuth(s, handleAckResolution(s)))
@@ -68,20 +71,45 @@ func handleRegisterAgent(s *store.Store) http.HandlerFunc {
 	}
 }
 
-func handleIngestEvents(s *store.Store) func(http.ResponseWriter, *http.Request, store.Agent) {
+// Ingest limits. Events now carry arguments and output previews (up to
+// 64 KiB each), so one batch is bounded in both count and bytes; the
+// forwarder ships at most 500 per request and loops, well within both.
+const (
+	maxIngestEvents = 5000
+	maxIngestBytes  = 16 << 20
+)
+
+func handleIngestEvents(s *store.Store, runner *anomalyRunner) func(http.ResponseWriter, *http.Request, store.Agent) {
 	type request struct {
 		Events []store.IngestedEvent `json:"events"`
 	}
 	return func(w http.ResponseWriter, r *http.Request, agent store.Agent) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxIngestBytes)
 		var req request
 		if err := readJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			return
+		}
+		if len(req.Events) > maxIngestEvents {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("too many events in one request (%d > %d)", len(req.Events), maxIngestEvents))
 			return
 		}
 		if err := s.InsertEvents(r.Context(), agent.TenantID, agent.ID, req.Events); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+
+		// Re-fetch: this batch may have just advanced last_agent_version,
+		// and detection needs the agent's *current* version, not the one
+		// resolved from the API key before the batch was inserted.
+		// context.Background() rather than r.Context(): maybeRun applies
+		// its own two independent timeouts (classification's and
+		// detection's), and must not inherit a cancellation tied to this
+		// HTTP request's lifetime.
+		if updated, err := s.GetAgent(r.Context(), agent.TenantID, agent.ID); err == nil {
+			runner.maybeRun(context.Background(), updated)
+		}
+
 		writeJSON(w, http.StatusOK, map[string]int{"accepted": len(req.Events)})
 	}
 }

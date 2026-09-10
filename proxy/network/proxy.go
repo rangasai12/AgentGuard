@@ -34,6 +34,12 @@ type Proxy struct {
 	CA      *CA
 	Approve approval.Func
 
+	// RunID and AgentVersion tag every audit event this proxy writes (see
+	// daemon.DecisionRequest). The CLI defaults them from $AGENTGUARD_RUN_ID
+	// and $AGENTGUARD_AGENT_VERSION, which an SDK-wrapped parent exports.
+	RunID        string
+	AgentVersion string
+
 	// UpstreamTLSConfig customizes how the proxy dials real origin servers
 	// after intercepting a CONNECT tunnel. nil means the system default
 	// trust store (real certificate verification) — the correct production
@@ -106,9 +112,9 @@ func (p *Proxy) handleConnect(conn net.Conn, req *http.Request) {
 	// completing a TLS handshake for it — a cheap, early SSRF/exfil guard
 	// that doesn't depend on decrypting anything.
 	if isIPLiteral(host) {
-		decision := p.evaluate(engine.Action{Actor: p.Actor, Type: engine.ActionNetwork, Domain: host, Method: "CONNECT", IsIPLiteral: true})
-		if decision.Result != engine.Allow {
-			writeSimpleResponse(conn, http.StatusForbidden, decision)
+		res := p.decide(engine.Action{Actor: p.Actor, Type: engine.ActionNetwork, Domain: host, Method: "CONNECT", IsIPLiteral: true})
+		if res.Decision.Result != engine.Allow {
+			writeSimpleResponse(conn, http.StatusForbidden, res.Decision)
 			return
 		}
 	}
@@ -185,21 +191,57 @@ func (p *Proxy) serveOneRequest(conn io.Writer, req *http.Request, viaTLS bool) 
 		Domain:      host,
 		Method:      req.Method,
 		IsIPLiteral: isIPLiteral(host),
+		// The path is recorded for the audit trail; the query string is
+		// deliberately omitted since it routinely carries tokens.
+		Args: map[string]any{"path": req.URL.Path},
 	}
-	decision := p.evaluate(action)
-	if decision.Result != engine.Allow {
-		writeSimpleResponse(conn, http.StatusForbidden, decision)
+	res := p.decide(action)
+	if res.Decision.Result != engine.Allow {
+		writeSimpleResponse(conn, http.StatusForbidden, res.Decision)
 		return false
 	}
 
+	start := time.Now()
 	resp, err := p.roundTrip(req)
 	if err != nil {
 		writeErrorResponse(conn, err)
+		p.report(res.EventID, daemon.Outcome{Status: daemon.OutcomeError, ExecMS: time.Since(start).Milliseconds(), Error: err.Error()})
 		return false
 	}
 	defer resp.Body.Close()
-	_ = resp.Write(conn)
+	// Relay the response, counting what was written: the body itself is
+	// streamed straight through and never captured, so the outcome records
+	// the status line and the size, not the content.
+	cw := &countingWriter{w: conn}
+	_ = resp.Write(cw)
+	status := daemon.OutcomeSuccess
+	if resp.StatusCode >= 400 {
+		status = daemon.OutcomeError
+	}
+	p.report(res.EventID, daemon.Outcome{Status: status, ExecMS: time.Since(start).Milliseconds(), Output: resp.Status, OutputBytes: cw.n})
 	return !resp.Close && !req.Close
+}
+
+// report records the outcome of an already-decided request against its
+// audit event; a nil Audit (logging disabled) makes it a no-op.
+func (p *Proxy) report(eventID string, o daemon.Outcome) {
+	if p.Audit == nil || eventID == "" {
+		return
+	}
+	_ = p.Audit.Report(eventID, o)
+}
+
+// countingWriter counts bytes written through it, so a relayed response's
+// size can be recorded without buffering it.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	n, err := c.w.Write(b)
+	c.n += int64(n)
+	return n, err
 }
 
 // roundTrip forwards req to its real origin using one shared *http.Transport
@@ -216,36 +258,12 @@ func (p *Proxy) roundTrip(req *http.Request) (*http.Response, error) {
 	return p.transport.RoundTrip(outReq)
 }
 
-func (p *Proxy) evaluate(action engine.Action) engine.Decision {
-	start := time.Now()
-	decision := engine.Evaluate(p.Policy, action)
-	final := decision
-
-	if decision.Result == engine.RequireApproval {
-		timeout := time.Duration(p.Policy.ApprovalTimeoutSeconds()) * time.Second
-		var result engine.Result
-		if p.Approve != nil {
-			result = p.Approve(action, decision, timeout)
-		}
-		if result == "" {
-			result = p.Policy.OnTimeoutResult()
-		}
-		final = engine.Decision{Result: result, MatchedRule: decision.MatchedRule, Reason: decision.Reason}
-	}
-
-	if p.Audit != nil {
-		_ = p.Audit.Log(daemon.AuditEvent{
-			Timestamp:   start,
-			Actor:       p.Actor,
-			ActionType:  action.Type,
-			Resource:    action.Resource(),
-			Decision:    final.Result,
-			MatchedRule: final.MatchedRule,
-			Reason:      final.Reason,
-			LatencyMS:   time.Since(start).Milliseconds(),
-		})
-	}
-	return final
+// decide runs the shared decision funnel (daemon.Decide) with this proxy's
+// identity and its terminal-prompt approval flow.
+func (p *Proxy) decide(action engine.Action) daemon.EvaluateResult {
+	return daemon.Decide(p.Policy, p.Audit, daemon.DecisionRequest{
+		Actor: p.Actor, RunID: p.RunID, AgentVersion: p.AgentVersion, Action: action,
+	}, daemon.PromptAwaiter(p.Approve))
 }
 
 func isIPLiteral(host string) bool {

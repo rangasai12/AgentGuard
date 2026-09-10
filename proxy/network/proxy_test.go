@@ -130,6 +130,33 @@ func TestPlainHTTPAllowedRequestIsForwarded(t *testing.T) {
 	if len(events) != 1 || events[0].Decision != engine.Allow {
 		t.Errorf("expected one Allow audit event, got %+v", events)
 	}
+	if events[0].Action == nil || events[0].Action.Args["path"] != "/" {
+		t.Errorf("expected the request path on the audit event's action, got %+v", events[0].Action)
+	}
+	// The outcome is reported after the response bytes are written to the
+	// client, so it can land a moment after client.Do returns.
+	o := waitForOutcome(t, audit)
+	if o.Status != daemon.OutcomeSuccess || o.Output != "200 OK" || o.OutputBytes <= int64(len(body)) {
+		t.Errorf("expected a success outcome with the status line and relayed size (> body %d), got %+v", len(body), o)
+	}
+	if o.OutputSHA256 != "" {
+		t.Errorf("response bodies are never captured, so no hash should be recorded, got %+v", o)
+	}
+}
+
+// waitForOutcome polls the audit log's single event until its outcome has
+// been reported (see the comment at its call site for why that is racy).
+func waitForOutcome(t *testing.T, audit *daemon.AuditLogger) daemon.Outcome {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ev := audit.Tail(1); len(ev) == 1 && ev[0].Outcome != nil {
+			return *ev[0].Outcome
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no outcome was reported for the relayed request: %+v", audit.Tail(1))
+	return daemon.Outcome{}
 }
 
 func TestPlainHTTPDeniedRequestNeverReachesOrigin(t *testing.T) {

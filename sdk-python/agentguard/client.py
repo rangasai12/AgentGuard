@@ -49,7 +49,11 @@ class DaemonClient:
 
     def call(self, cmd: str, **fields: Any) -> dict:
         payload = {"cmd": cmd, **{k: v for k, v in fields.items() if v is not None}}
-        data = json.dumps(payload).encode("utf-8") + b"\n"
+        # default=str: evaluate requests now carry a tool's arguments, which
+        # may include values (Paths, Decimals, dataclasses…) json can't
+        # encode natively; a non-encodable argument must never turn into a
+        # blocked tool call.
+        data = json.dumps(payload, default=str).encode("utf-8") + b"\n"
 
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:

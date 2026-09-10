@@ -5,6 +5,11 @@
 // through unchanged. This requires zero code changes to either the agent or
 // the MCP server — only the launch command changes (point it at the proxy
 // instead of the real server).
+//
+// Because the proxy also sees every response the server sends back, it
+// correlates each forwarded tools/call with its JSON-RPC response by id and
+// records the call's outcome (success/error, duration, a bounded preview of
+// the result) against the same audit event the decision was logged as.
 package mcp
 
 import (
@@ -31,10 +36,19 @@ type rpcMessage struct {
 	ID      json.RawMessage `json:"id,omitempty"`
 	Method  string          `json:"method,omitempty"`
 	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   json.RawMessage `json:"error,omitempty"`
 }
 
 type toolCallParams struct {
-	Name string `json:"name"`
+	Name      string         `json:"name"`
+	Arguments map[string]any `json:"arguments,omitempty"`
+}
+
+// inflightCall is a forwarded tools/call awaiting its response.
+type inflightCall struct {
+	eventID string
+	start   time.Time
 }
 
 // Proxy intercepts tools/call requests between an MCP client and server.
@@ -44,6 +58,30 @@ type Proxy struct {
 	ServerName string
 	Actor      string
 	Approve    approval.Func
+
+	// RunID and AgentVersion tag every audit event this proxy writes (see
+	// daemon.DecisionRequest). The CLI defaults them from $AGENTGUARD_RUN_ID
+	// and $AGENTGUARD_AGENT_VERSION, which an SDK-wrapped parent exports.
+	RunID        string
+	AgentVersion string
+
+	// inflight maps a forwarded tools/call's raw JSON-RPC id to the audit
+	// event it was logged as, so the response can be reported against it.
+	// Keyed by the id's raw bytes: a server that re-encodes `1` as `1.0`
+	// would miss correlation, which has not been observed in practice.
+	// Entries whose response never arrives stay until the process exits —
+	// proxies are one-per-session and short-lived, so this is not bounded.
+	mu       sync.Mutex
+	inflight map[string]inflightCall
+
+	// listRequests holds the ids of forwarded tools/list requests so their
+	// responses can be recognized; descriptions caches each tool's
+	// description from those responses, and described records which
+	// tools have already had it attached to an audit event (it is sent on
+	// the first call to each tool only — see engine.Action.Description).
+	listRequests map[string]bool
+	descriptions map[string]string
+	described    map[string]bool
 }
 
 // New returns a Proxy that prompts for approval on the controlling terminal
@@ -85,7 +123,8 @@ func (p *Proxy) RunCommand(ctx context.Context, command string, args []string, c
 
 // run wires the two directions of a proxied session: client requests flow
 // through handleClientLine (which may intercept and short-circuit tool
-// calls), and server responses pass through unchanged. It returns when
+// calls), and server responses pass through unchanged (after being matched
+// against in-flight tool calls for outcome reporting). It returns when
 // either side reaches EOF/errors, or ctx is canceled.
 //
 // serverIn must be closed once the client's input ends, or the subprocess on
@@ -98,15 +137,16 @@ func (p *Proxy) run(ctx context.Context, clientIn io.Reader, clientOut io.Writer
 	done := make(chan error, 2)
 
 	// Both directions can write to clientOut concurrently: pumpClientToServer
-	// writes synthesized deny/error responses, pumpLines writes forwarded
-	// server responses. Without synchronization, two large-enough concurrent
-	// messages could interleave mid-write and corrupt the one-message-per-line
-	// framing the MCP stdio transport requires. writeLine issues exactly one
-	// Write per message, so a plain mutex around clientOut is sufficient.
+	// writes synthesized deny/error responses, pumpServerToClient writes
+	// forwarded server responses. Without synchronization, two large-enough
+	// concurrent messages could interleave mid-write and corrupt the
+	// one-message-per-line framing the MCP stdio transport requires.
+	// writeLine issues exactly one Write per message, so a plain mutex
+	// around clientOut is sufficient.
 	syncOut := &syncWriter{w: clientOut}
 
 	go func() { done <- p.pumpClientToServer(clientIn, syncOut, serverIn) }()
-	go func() { done <- pumpLines(serverOut, syncOut) }()
+	go func() { done <- p.pumpServerToClient(serverOut, syncOut) }()
 
 	select {
 	case err := <-done:
@@ -137,15 +177,109 @@ func (p *Proxy) pumpClientToServer(clientIn io.Reader, clientOut io.Writer, serv
 	return scanner.Err()
 }
 
-func pumpLines(src io.Reader, dst io.Writer) error {
+// pumpServerToClient relays every server line to the client unchanged. On
+// the way through, a line that is a response (has an id and no method — a
+// server's own requests to the client, e.g. sampling, carry a method and
+// their own id space, so they must not be mistaken for responses) is
+// matched against the in-flight tool calls and its outcome reported.
+func (p *Proxy) pumpServerToClient(src io.Reader, dst io.Writer) error {
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(make([]byte, 4096), maxLineBytes)
 	for scanner.Scan() {
-		if err := writeLine(dst, scanner.Bytes()); err != nil {
+		line := scanner.Bytes()
+		p.observeServerLine(line)
+		if err := writeLine(dst, line); err != nil {
 			return err
 		}
 	}
 	return scanner.Err()
+}
+
+// observeServerLine reports the outcome of a forwarded tools/call when line
+// is its response. It never alters or withholds the line.
+func (p *Proxy) observeServerLine(line []byte) {
+	if p.Audit == nil {
+		return
+	}
+	var msg rpcMessage
+	if err := json.Unmarshal(line, &msg); err != nil || len(msg.ID) == 0 || msg.Method != "" {
+		return
+	}
+	p.mu.Lock()
+	call, ok := p.inflight[string(msg.ID)]
+	if ok {
+		delete(p.inflight, string(msg.ID))
+	}
+	isList := p.listRequests[string(msg.ID)]
+	if isList {
+		delete(p.listRequests, string(msg.ID))
+	}
+	p.mu.Unlock()
+	if isList {
+		p.rememberDescriptions(msg.Result)
+		return
+	}
+	if !ok {
+		return
+	}
+
+	o := daemon.Outcome{Status: daemon.OutcomeSuccess, ExecMS: time.Since(call.start).Milliseconds()}
+	switch {
+	case len(msg.Error) > 0:
+		o.Status = daemon.OutcomeError
+		o.Error = string(msg.Error)
+	default:
+		// MCP signals a tool-level failure inside a successful JSON-RPC
+		// response via result.isError.
+		var res struct {
+			IsError bool `json:"isError"`
+		}
+		if json.Unmarshal(msg.Result, &res) == nil && res.IsError {
+			o.Status = daemon.OutcomeError
+		}
+		o.Output = string(msg.Result)
+	}
+	_ = p.Audit.Report(call.eventID, o)
+}
+
+// rememberDescriptions caches tool descriptions from a tools/list result
+// so the first tools/call to each tool can carry one.
+func (p *Proxy) rememberDescriptions(result json.RawMessage) {
+	var res struct {
+		Tools []struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+		} `json:"tools"`
+	}
+	if json.Unmarshal(result, &res) != nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.descriptions == nil {
+		p.descriptions = make(map[string]string)
+	}
+	for _, t := range res.Tools {
+		if t.Name != "" && t.Description != "" {
+			p.descriptions[t.Name] = t.Description // daemon.Decide caps the length
+		}
+	}
+}
+
+// descriptionFor returns the cached description for tool the first time
+// it is asked, and "" afterwards.
+func (p *Proxy) descriptionFor(tool string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	d, ok := p.descriptions[tool]
+	if !ok || p.described[tool] {
+		return ""
+	}
+	if p.described == nil {
+		p.described = make(map[string]bool)
+	}
+	p.described[tool] = true
+	return d
 }
 
 // writeLine writes line plus a trailing newline as a single Write call, so
@@ -176,12 +310,21 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 // request that policy denies, it returns a synthesized JSON-RPC error
 // response (to be sent to the client) and forward == nil, so nothing reaches
 // the real server. Otherwise it returns the original line unchanged to be
-// forwarded as-is.
+// forwarded as-is, remembering the call so its response can be reported.
 func (p *Proxy) handleClientLine(line []byte) (forward []byte, response []byte) {
 	var msg rpcMessage
 	if err := json.Unmarshal(line, &msg); err != nil {
 		// Not a JSON-RPC message we understand; pass it through rather than
 		// breaking the session over a shape we don't recognize.
+		return line, nil
+	}
+	if msg.Method == "tools/list" && len(msg.ID) > 0 && p.Audit != nil {
+		p.mu.Lock()
+		if p.listRequests == nil {
+			p.listRequests = make(map[string]bool)
+		}
+		p.listRequests[string(msg.ID)] = true
+		p.mu.Unlock()
 		return line, nil
 	}
 	if msg.Method != "tools/call" {
@@ -192,44 +335,22 @@ func (p *Proxy) handleClientLine(line []byte) (forward []byte, response []byte) 
 		return line, nil
 	}
 
-	action := engine.Action{Actor: p.Actor, Type: engine.ActionMCPTool, Server: p.ServerName, Tool: params.Name}
-	decision := p.evaluate(action)
-	if decision.Result == engine.Allow {
-		return line, nil
+	action := engine.Action{Actor: p.Actor, Type: engine.ActionMCPTool, Server: p.ServerName, Tool: params.Name, Args: params.Arguments, Description: p.descriptionFor(params.Name)}
+	res := daemon.Decide(p.Policy, p.Audit, daemon.DecisionRequest{
+		Actor: p.Actor, RunID: p.RunID, AgentVersion: p.AgentVersion, Action: action,
+	}, daemon.PromptAwaiter(p.Approve))
+	if res.Decision.Result != engine.Allow {
+		return nil, marshalErrorResponse(msg.ID, res.Decision)
 	}
-	return nil, marshalErrorResponse(msg.ID, decision)
-}
-
-func (p *Proxy) evaluate(action engine.Action) engine.Decision {
-	start := time.Now()
-	decision := engine.Evaluate(p.Policy, action)
-	final := decision
-
-	if decision.Result == engine.RequireApproval {
-		timeout := time.Duration(p.Policy.ApprovalTimeoutSeconds()) * time.Second
-		var result engine.Result
-		if p.Approve != nil {
-			result = p.Approve(action, decision, timeout)
+	if len(msg.ID) > 0 && p.Audit != nil {
+		p.mu.Lock()
+		if p.inflight == nil {
+			p.inflight = make(map[string]inflightCall)
 		}
-		if result == "" {
-			result = p.Policy.OnTimeoutResult()
-		}
-		final = engine.Decision{Result: result, MatchedRule: decision.MatchedRule, Reason: decision.Reason}
+		p.inflight[string(msg.ID)] = inflightCall{eventID: res.EventID, start: time.Now()}
+		p.mu.Unlock()
 	}
-
-	if p.Audit != nil {
-		_ = p.Audit.Log(daemon.AuditEvent{
-			Timestamp:   start,
-			Actor:       p.Actor,
-			ActionType:  action.Type,
-			Resource:    action.Resource(),
-			Decision:    final.Result,
-			MatchedRule: final.MatchedRule,
-			Reason:      final.Reason,
-			LatencyMS:   time.Since(start).Milliseconds(),
-		})
-	}
-	return final
+	return line, nil
 }
 
 func marshalErrorResponse(id json.RawMessage, decision engine.Decision) []byte {

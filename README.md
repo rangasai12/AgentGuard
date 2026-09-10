@@ -166,6 +166,12 @@ ships that machine's audit log and relays browser approve/deny decisions back to
 its local daemon. The cloud is strictly additive: local enforcement keeps working
 even if it's unreachable.
 
+## Contributing
+
+Read `docs/conventions.md` before adding code. It records the one rule this repo
+enforces on itself: never a second implementation of something that already
+exists, and a written justification in `CHANGELOG.md` for every new symbol.
+
 ## Testing
 
 ```bash

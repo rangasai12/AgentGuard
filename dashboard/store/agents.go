@@ -58,15 +58,34 @@ func (s *Store) AgentFromAPIKey(ctx context.Context, apiKey string) (Agent, erro
 	hash := hashSecret(apiKey)
 	var a Agent
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, tenant_id, name, status, last_seen_at, created_at
+		`SELECT id, tenant_id, name, status, last_seen_at, created_at, last_agent_version, last_policy_hash
 		 FROM agents WHERE api_key_hash = $1 AND status = 'active'`,
 		hash,
-	).Scan(&a.ID, &a.TenantID, &a.Name, &a.Status, &a.LastSeenAt, &a.CreatedAt)
+	).Scan(&a.ID, &a.TenantID, &a.Name, &a.Status, &a.LastSeenAt, &a.CreatedAt, &a.LastAgentVersion, &a.LastPolicyHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Agent{}, ErrNotFound
 	}
 	if err != nil {
 		return Agent{}, fmt.Errorf("looking up agent by api key: %w", err)
+	}
+	return a, nil
+}
+
+// GetAgent returns one agent by id, scoped to tenantID — the one place
+// that needs a single fresh row (e.g. its last_agent_version right after
+// an ingest just updated it) rather than the whole tenant's list.
+func (s *Store) GetAgent(ctx context.Context, tenantID, agentID string) (Agent, error) {
+	var a Agent
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, tenant_id, name, status, last_seen_at, created_at, last_agent_version, last_policy_hash
+		 FROM agents WHERE id = $1 AND tenant_id = $2`,
+		agentID, tenantID,
+	).Scan(&a.ID, &a.TenantID, &a.Name, &a.Status, &a.LastSeenAt, &a.CreatedAt, &a.LastAgentVersion, &a.LastPolicyHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Agent{}, ErrNotFound
+	}
+	if err != nil {
+		return Agent{}, fmt.Errorf("getting agent: %w", err)
 	}
 	return a, nil
 }
@@ -82,7 +101,7 @@ func (s *Store) TouchAgent(ctx context.Context, agentID string) error {
 // ListAgents returns every agent registered under tenantID.
 func (s *Store) ListAgents(ctx context.Context, tenantID string) ([]Agent, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT id, tenant_id, name, status, last_seen_at, created_at
+		`SELECT id, tenant_id, name, status, last_seen_at, created_at, last_agent_version, last_policy_hash
 		 FROM agents WHERE tenant_id = $1 ORDER BY created_at DESC`,
 		tenantID,
 	)
@@ -94,7 +113,7 @@ func (s *Store) ListAgents(ctx context.Context, tenantID string) ([]Agent, error
 	var out []Agent
 	for rows.Next() {
 		var a Agent
-		if err := rows.Scan(&a.ID, &a.TenantID, &a.Name, &a.Status, &a.LastSeenAt, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.TenantID, &a.Name, &a.Status, &a.LastSeenAt, &a.CreatedAt, &a.LastAgentVersion, &a.LastPolicyHash); err != nil {
 			return nil, err
 		}
 		out = append(out, a)

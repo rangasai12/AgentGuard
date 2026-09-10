@@ -364,6 +364,87 @@ for block in response.content:
 No separate adapter module — `wrap_tools()` already duck-types LangChain's
 `Tool`/`BaseTool` shapes directly (see above).
 
+## Outcomes: what the tool returned, and how long it took
+
+Every wrapper above does two things, not one. Before the tool runs it asks
+the daemon for a decision; after the tool returns (or raises) it *reports
+the outcome* against that same decision, so the audit event ends up with:
+
+| Field | Meaning |
+|---|---|
+| `outcome.status` | `success`, or `error` if the tool raised. |
+| `outcome.exec_ms` | Wall-clock time of the tool itself (the event's `latency_ms` is the policy decision plus any approval wait — a different thing). |
+| `outcome.output` | A preview of the return value, JSON-encoded for anything that isn't already a string. `max_output_bytes` (default 4096) bounds it; the daemon caps it at 64 KiB regardless. |
+| `outcome.output_bytes`, `outcome.output_sha256` | Size and hash of the *full* return value, so a truncated preview is still verifiable. |
+| `outcome.error` | `ExceptionType: message` when the tool raised. |
+
+The call's arguments are recorded on the event too (`action.args`), bound
+by parameter name where the function's signature allows it. String
+arguments longer than 16 KiB are cut with a `…[truncated, N chars]` marker
+so a tool that takes a whole file's contents can never push an evaluate
+request past the daemon's line limit. Keys listed in the policy's
+`audit.redact_args` are stored as `"[redacted]"` — policy conditions still
+see the real values.
+
+Reporting is best-effort and asynchronous to the tool's result: a report
+the daemon rejects or never receives is dropped, and the tool's return
+value or exception reaches your code unchanged. Turn the output preview
+off with `Guard(capture_output=False)` or `AGENTGUARD_CAPTURE_OUTPUT=0`;
+status and timing are still reported. A denied call never runs, so it
+never has an outcome.
+
+Async tools work: a `@guard.tool()` / `@guard.checked()` / `@guard.function()`
+on an `async def` yields an `async def` wrapper (so frameworks that check
+`inspect.iscoroutinefunction` still see one), the policy check runs in a
+thread so an approval wait never blocks the event loop, and the outcome is
+reported once the awaited result resolves.
+
+## Run and version identity
+
+Two identifiers ride along on every decision:
+
+- **`run_id`** — one execution of the agent. `Guard` takes it from the
+  `run_id` argument, else `AGENTGUARD_RUN_ID`, else generates one; either
+  way it is exported back into the process environment, so anything the
+  agent launches (an MCP server behind `agentctl mcp-proxy`, a command
+  under `agentctl run`) tags its own events with the same run. In the
+  dashboard this is what groups a task's tool calls together.
+- **`agent_version`** — the build of the agent. The dashboard's Fleet
+  page profiles each version separately and shows how version N differs
+  from N-1, and the anomaly detector baselines per version. The value
+  comes from, in order:
+  1. the `agent_version` argument;
+  2. `AGENTGUARD_AGENT_VERSION`;
+  3. `git:<12-char commit>` — the commit `HEAD` points at in the nearest
+     `.git` at or above the working directory, read directly (no `git`
+     binary needed);
+  4. `tools:<12-char hash>` — a SHA-256 over the names and parameter names
+     of every tool this `Guard` wrapped, frozen at the first decision.
+  Explicit always wins. A derived version is exported to
+  `AGENTGUARD_AGENT_VERSION` so child processes share it. Pass
+  `auto_version=False` to record no version when none is given.
+  Two things the automatic values cannot see: a **prompt-only change**
+  leaves the tools fingerprint unchanged, and an uncommitted working tree
+  still reports the last commit. Set the version explicitly from your
+  deploy when either matters.
+
+```python
+guard = Guard(policy="policy.yaml", agent_version=os.environ.get("GIT_SHA", "dev"))
+```
+
+## Tool descriptions
+
+Every wrapper also records what a tool says about itself — the first
+paragraph of a function's docstring for `@guard.tool()` / `@guard.function()`,
+`.description` for LangChain-style objects — and sends it on the **first**
+decision for that tool in each process (capped at 512 bytes). The
+dashboard keeps a per-tenant tool catalog from these (`GET /api/tools`,
+and tooltips on an agent's footprint), and the anomaly detector uses them
+to classify each tool as a read, write, delete, or permission operation
+without any configuration from you. Nothing is sent for tools with no
+description; `guard.remember_description(name, text)` supplies one for a
+tool shape the wrappers do not recognize.
+
 ## Approvals and timeouts
 
 Any check whose decision is `require_approval` **blocks the calling thread**
@@ -402,6 +483,9 @@ Two things follow from this:
 |---|---|
 | `AGENTGUARD_SOCKET` | Overrides the default daemon socket path (`~/.agentguard/agentguard.sock`) for both the SDK and `agentctl`. |
 | `AGENTGUARD_AUDIT_LOG` | Overrides the default JSONL audit log path used by `agentctl daemon start`. |
+| `AGENTGUARD_RUN_ID` | Run id to tag decisions with; set by `Guard` if absent and inherited by child processes. |
+| `AGENTGUARD_AGENT_VERSION` | Agent version to tag decisions with (`Guard(agent_version=...)` overrides). |
+| `AGENTGUARD_CAPTURE_OUTPUT` | `0`/`false`/`no` disables the output preview in outcome reports (status and timing are still reported). |
 
 `Guard(socket_path=...)` overrides the env var for that instance only.
 
@@ -410,6 +494,16 @@ Two things follow from this:
 - **Policy correctness** (no Python needed): write cases in a
   `*.traces.yaml` file and run `agentctl policy test policy.yaml traces.yaml`
   — see `policy-spec/examples/coding-agent.traces.yaml`.
+- **Or record them instead of writing them**: run your agent, then
+  `agentctl policy record --output traces.yaml` turns the daemon's recent
+  audit events (the real actions, with their real arguments) into that
+  same trace format with the engine's decision as each case's `want`.
+  Review the expectations, commit the file, and later policy changes are
+  regression-tested against what the agent actually did. It accepts the
+  same `--type/--decision/--actor/--run` filters as `agentctl audit query`
+  (`--run $AGENTGUARD_RUN_ID` records just the last run). Redacted
+  arguments replay as `"[redacted]"`, so a `functions` condition on a
+  redacted key will not reproduce.
 - **Your tool wiring, against the real engine**: if your module builds its
   own `Guard` at import time the way `@guard.checked` is meant to be used
   (see `tools.py`), your test setup needs a real daemon *already listening*
@@ -434,10 +528,11 @@ Two things follow from this:
   (see [Testing your integration](#testing-your-integration)).
 - `mcp_tool` actions (real MCP `tools/call` interception via
   `agentctl mcp-proxy`, and the plain name-based `check()`/`wrap_tools()`
-  path) still carry only `server`+`tool` — the engine cannot inspect a real
-  MCP tool call's *arguments* today, only its name. For SDK-wrapped
+  path) are *decided* on `server`+`tool` only. Their arguments are now
+  captured on the audit event (and redacted per `audit.redact_args`), but
+  the `mcp` policy section has no argument conditions. For SDK-wrapped
   functions this is fully solved by `@guard.function()` + the `functions`
   policy section above; a generic MCP tool exposed by a *server* you don't
   control still needs to be split into distinctly named tools (or checked
   explicitly via `evaluate_action` inside a proxy-side handler) to get
-  argument-aware enforcement.
+  argument-aware *enforcement*.

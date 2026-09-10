@@ -41,6 +41,8 @@ func runProxyStart(args []string, stdout, stderr io.Writer) int {
 	caCertPath := fs.String("ca-cert", DefaultCACertPath(), "path to the interception CA certificate (created if missing)")
 	caKeyPath := fs.String("ca-key", DefaultCAKeyPath(), "path to the interception CA private key (created if missing)")
 	actor := fs.String("actor", "", "actor name recorded in audit events")
+	runID := fs.String("run-id", os.Getenv("AGENTGUARD_RUN_ID"), "run id recorded in audit events (default $AGENTGUARD_RUN_ID, as set by an SDK-wrapped parent process)")
+	agentVersion := fs.String("agent-version", os.Getenv("AGENTGUARD_AGENT_VERSION"), "agent version recorded in audit events (default $AGENTGUARD_AGENT_VERSION)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -73,6 +75,7 @@ func runProxyStart(args []string, stdout, stderr io.Writer) int {
 	defer audit.Close()
 
 	proxy := networkproxy.New(policy, audit, ca, *actor)
+	proxy.RunID, proxy.AgentVersion = *runID, *agentVersion
 
 	fmt.Fprintf(stdout, "agentguard network proxy listening on %s (policy: %s)\n", *addr, *policyPath)
 	fmt.Fprintf(stdout, "point your client's HTTP(S)_PROXY at this address, and trust the CA certificate:\n  %s\n", *caCertPath)

@@ -55,9 +55,10 @@ Usage:
   agentctl init [--output policy.yaml]
   agentctl policy validate <file>
   agentctl policy test <policy.yaml> <traces.yaml>
+  agentctl policy record [--output traces.yaml] [-n 100] [--type TYPE] [--decision D] [--actor NAME] [--run ID] [--socket path]
   agentctl daemon start [--policy policy.yaml] [--socket path] [--audit path]
   agentctl audit tail [-n 20] [--socket path]
-  agentctl audit query [--type TYPE] [--decision allow|deny|require_approval] [--actor NAME] [--socket path]
+  agentctl audit query [--type TYPE] [--decision allow|deny|require_approval] [--actor NAME] [--run ID] [--socket path]
   agentctl approve <id> [--socket path]
   agentctl deny <id> [--socket path]
   agentctl pending [--socket path]

@@ -3,7 +3,7 @@ import { useCallback } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { usePolling } from "../hooks/usePolling";
 import { api } from "../api/client";
-import { IconOverview, IconFleet, IconFeed, IconApprovals } from "./icons";
+import { IconOverview, IconFleet, IconFeed, IconApprovals, IconSettings } from "./icons";
 
 const NAV_GROUPS = [
   {
@@ -17,6 +17,10 @@ const NAV_GROUPS = [
   {
     label: "Fleet",
     items: [{ to: "/agents", label: "Agents", icon: IconFleet }],
+  },
+  {
+    label: "Configuration",
+    items: [{ to: "/settings", label: "Settings", icon: IconSettings }],
   },
 ];
 

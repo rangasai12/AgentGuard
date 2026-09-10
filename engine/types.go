@@ -61,6 +61,13 @@ type Action struct {
 	// scalar the caller passed (string, number, bool) — see
 	// conditionHolds for how they're compared.
 	Args map[string]any `json:"args,omitempty" yaml:"args,omitempty"`
+
+	// Description is the tool's own one-line description (a docstring, a
+	// LangChain tool's .description, an MCP server's tools/list entry),
+	// sent by an enforcement point on the *first* call to each tool it
+	// sees so the cloud can catalog and classify tools without a second
+	// channel. The evaluator ignores it; it is audit metadata only.
+	Description string `json:"description,omitempty" yaml:"description,omitempty"`
 }
 
 // Result is the outcome of a policy decision.

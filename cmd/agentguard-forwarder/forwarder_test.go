@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,15 +128,26 @@ func TestForwarderShipsNewAuditEvents(t *testing.T) {
 		t.Fatalf("dialing daemon: %v", err)
 	}
 	evalResp, err := c.Call(daemon.Request{
-		Cmd:    "evaluate",
-		Actor:  "test-actor",
-		Action: engine.Action{Type: engine.ActionFSWrite, Path: "/prod/config.txt"},
+		Cmd:          "evaluate",
+		Actor:        "test-actor",
+		RunID:        "run-fwd",
+		AgentVersion: "0.9",
+		Action:       engine.Action{Type: engine.ActionFSWrite, Path: "/prod/config.txt", Args: map[string]any{"mode": "0644"}},
 	})
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
 	if evalResp.Decision == nil || evalResp.Decision.Result != engine.Deny {
 		t.Fatalf("expected deny for a write outside /workspace, got %+v", evalResp.Decision)
+	}
+	if evalResp.EventID == "" {
+		t.Fatal("expected evaluate to return an event_id")
+	}
+	// Report an outcome for it, exactly as an SDK would after running the
+	// tool (a deny would not normally run, but the mechanism is the same).
+	repResp, err := c.Call(daemon.Request{Cmd: "report", ID: evalResp.EventID, Outcome: &daemon.Outcome{Status: daemon.OutcomeError, ExecMS: 3, Error: "refused"}})
+	if err != nil || !repResp.OK {
+		t.Fatalf("report: err=%v resp=%+v", err, repResp)
 	}
 	c.Close()
 
@@ -156,6 +169,23 @@ func TestForwarderShipsNewAuditEvents(t *testing.T) {
 	if events[0].AgentID != agentID {
 		t.Fatalf("event shipped under agent %q, want %q", events[0].AgentID, agentID)
 	}
+	// The decision line and its outcome patch line were both shipped, and
+	// the cloud merged them into the one row.
+	ev := events[0]
+	if ev.EventID != evalResp.EventID || ev.RunID != "run-fwd" || ev.AgentVersion != "0.9" || ev.PolicyHash == "" {
+		t.Fatalf("identity fields not shipped: %+v", ev)
+	}
+	var action engine.Action
+	if err := json.Unmarshal(ev.Action, &action); err != nil || action.Path != "/prod/config.txt" || action.Args["mode"] != "0644" {
+		t.Fatalf("expected the structured action (with args) to be shipped, got %s (err=%v)", ev.Action, err)
+	}
+	if ev.Outcome == nil || ev.Outcome.Status != "error" || ev.Outcome.ExecMS != 3 || ev.Outcome.Error != "refused" || ev.Outcome.ReportedAt == nil {
+		t.Fatalf("expected the outcome patch to be merged into the decision row, got %+v", ev.Outcome)
+	}
+	agents, err := s.ListAgents(ctx, tenantID)
+	if err != nil || len(agents) != 1 || agents[0].LastAgentVersion != "0.9" || agents[0].LastPolicyHash != ev.PolicyHash {
+		t.Fatalf("expected the agent row to record the last seen version/policy, got %+v (err=%v)", agents, err)
+	}
 
 	// A second tick with no new log lines should ship nothing new.
 	f.tick()
@@ -165,6 +195,35 @@ func TestForwarderShipsNewAuditEvents(t *testing.T) {
 	}
 	if len(eventsAfter) != 1 {
 		t.Fatalf("expected no duplicate shipping on a tick with no new lines, got %d events", len(eventsAfter))
+	}
+}
+
+func TestReadNewEventsBatches(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	var lines []string
+	for i := 0; i < 5; i++ {
+		lines = append(lines, `{"timestamp":"2026-09-09T00:00:0`+string(rune('0'+i))+`Z","action_type":"shell","resource":"cmd`+string(rune('0'+i))+`","decision":"allow","matched_rule":"r"}`)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, off1, err := readNewEvents(path, 0, 2)
+	if err != nil || len(first) != 2 || first[1].Resource != "cmd1" {
+		t.Fatalf("first batch: %+v off=%d err=%v", first, off1, err)
+	}
+	second, off2, err := readNewEvents(path, off1, 2)
+	if err != nil || len(second) != 2 || second[0].Resource != "cmd2" {
+		t.Fatalf("second batch must resume exactly after the first: %+v err=%v", second, err)
+	}
+	third, off3, err := readNewEvents(path, off2, 2)
+	if err != nil || len(third) != 1 || third[0].Resource != "cmd4" {
+		t.Fatalf("third batch: %+v err=%v", third, err)
+	}
+	if rest, _, _ := readNewEvents(path, off3, 2); len(rest) != 0 {
+		t.Fatalf("expected nothing after the log is drained, got %+v", rest)
+	}
+	if all, _, _ := readNewEvents(path, 0, 0); len(all) != 5 {
+		t.Fatalf("maxEvents <= 0 must mean unbounded, got %d", len(all))
 	}
 }
 
@@ -201,7 +260,7 @@ func TestForwarderRelaysBrowserApprovalToLocalDaemon(t *testing.T) {
 	// approval, exactly like a real agent's tool call would.
 	resultCh := make(chan engine.Result, 1)
 	go func() {
-		res := d.Evaluate("test-actor", engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"})
+		res := d.Evaluate(daemon.DecisionRequest{Actor: "test-actor", Action: engine.Action{Type: engine.ActionShell, Command: "rm -rf /workspace/build"}})
 		resultCh <- res.Decision.Result
 	}()
 

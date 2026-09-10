@@ -232,3 +232,19 @@ properties:
           `proxy start` commands remain TTY-only for approvals in v0.2,
           since they have no daemon-backed, remotely-resolvable approval ID
           to notify about.
+
+  audit:
+    type: object
+    additionalProperties: false
+    description: >
+      What the audit log records about an action (as opposed to whether the
+      action is allowed). Applied identically by every enforcement surface.
+    properties:
+      redact_args:
+        type: array
+        items: { type: string, minLength: 1 }
+        description: >
+          Argument keys (exact, case-sensitive match against the action's
+          args) whose values are replaced with "[redacted]" before the action
+          is written to the audit log or shown to an approver. Policy
+          conditions still evaluate against the real values.

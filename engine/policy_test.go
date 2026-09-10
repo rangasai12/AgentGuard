@@ -1,6 +1,9 @@
 package engine
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestValidateRejectsBadVersion(t *testing.T) {
 	_, err := ParsePolicy([]byte("version: 2\n"))
@@ -166,5 +169,48 @@ func TestLoadPolicyMissingFile(t *testing.T) {
 	_, err := LoadPolicy("/nonexistent/path/policy.yaml")
 	if err == nil {
 		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestParsePolicySetsHash(t *testing.T) {
+	a, err := ParsePolicy([]byte("version: 1\nname: a\n"))
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	b, err := ParsePolicy([]byte("version: 1\nname: b\n"))
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	if len(a.Hash) != 12 || a.Hash == b.Hash {
+		t.Errorf("expected distinct 12-hex hashes for distinct policy text, got %q and %q", a.Hash, b.Hash)
+	}
+	again, _ := ParsePolicy([]byte("version: 1\nname: a\n"))
+	if again.Hash != a.Hash {
+		t.Errorf("expected the hash to be a pure function of the policy text, got %q vs %q", again.Hash, a.Hash)
+	}
+}
+
+func TestRedactArgs(t *testing.T) {
+	p, err := ParsePolicy([]byte("version: 1\naudit:\n  redact_args: [password, token]\n"))
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	in := map[string]any{"user": "u", "password": "p", "n": 1}
+	out := p.RedactArgs(in)
+	if out["password"] != "[redacted]" || out["user"] != "u" || out["n"] != 1 {
+		t.Errorf("unexpected redaction result: %v", out)
+	}
+	if in["password"] != "p" {
+		t.Error("RedactArgs must not mutate its input")
+	}
+	if _, ok := out["token"]; ok {
+		t.Error("a listed key absent from the input must not be added")
+	}
+	untouched := map[string]any{"a": 1}
+	if got := p.RedactArgs(untouched); fmt.Sprintf("%p", got) != fmt.Sprintf("%p", untouched) {
+		t.Error("expected the same map back when nothing needs redacting")
+	}
+	if _, err := ParsePolicy([]byte("version: 1\naudit:\n  redact_args: [\"\"]\n")); err == nil {
+		t.Error("expected an empty redact_args key to be rejected")
 	}
 }

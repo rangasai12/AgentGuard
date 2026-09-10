@@ -114,6 +114,9 @@ func TestSocketAPIEvaluateAllowAndDeny(t *testing.T) {
 	if !resp.OK || resp.Decision == nil || resp.Decision.Result != engine.Allow {
 		t.Fatalf("expected allow decision, got %+v", resp)
 	}
+	if resp.EventID == "" {
+		t.Fatalf("expected evaluate to return an event_id for later report, got %+v", resp)
+	}
 
 	resp = c.send(t, Request{Cmd: "evaluate", Actor: "agent-1", Action: engine.Action{Type: engine.ActionFSWrite, Path: "/etc/passwd"}})
 	if !resp.OK || resp.Decision == nil || resp.Decision.Result != engine.Deny {
@@ -186,5 +189,49 @@ func TestSocketAPIAuditTailOverSocket(t *testing.T) {
 	resp := c.send(t, Request{Cmd: "audit_tail", N: 10})
 	if !resp.OK || len(resp.Events) != 2 {
 		t.Fatalf("expected 2 audit events over the socket, got %+v", resp)
+	}
+}
+
+func TestSocketAPIReportOutcomeRoundTrip(t *testing.T) {
+	_, socketPath := startTestServer(t)
+	c := dialTestDaemon(t, socketPath)
+
+	eval := c.send(t, Request{Cmd: "evaluate", Actor: "a", RunID: "run-1", AgentVersion: "2.0", Action: engine.Action{Type: engine.ActionFSWrite, Path: "/workspace/x"}})
+	if !eval.OK || eval.EventID == "" {
+		t.Fatalf("evaluate: %+v", eval)
+	}
+
+	// A report over a *different* connection, as an SDK's connect-per-call
+	// client would do.
+	c2 := dialTestDaemon(t, socketPath)
+	rep := c2.send(t, Request{Cmd: "report", ID: eval.EventID, Outcome: &Outcome{Status: OutcomeSuccess, ExecMS: 7, Output: "ok"}})
+	if !rep.OK {
+		t.Fatalf("report: %+v", rep)
+	}
+
+	tail := c.send(t, Request{Cmd: "audit_tail", N: 10})
+	if !tail.OK || len(tail.Events) != 1 {
+		t.Fatalf("expected exactly one merged event over the socket, got %+v", tail)
+	}
+	ev := tail.Events[0]
+	if ev.EventID != eval.EventID || ev.RunID != "run-1" || ev.AgentVersion != "2.0" {
+		t.Errorf("identity fields not round-tripped: %+v", ev)
+	}
+	if ev.Outcome == nil || ev.Outcome.Status != OutcomeSuccess || ev.Outcome.ExecMS != 7 || ev.Outcome.Output != "ok" {
+		t.Errorf("expected the reported outcome on the event, got %+v", ev.Outcome)
+	}
+
+	// Filtering by run id works over the socket too.
+	byRun := c.send(t, Request{Cmd: "audit_query", Filter: AuditFilter{RunID: "run-1"}})
+	if !byRun.OK || len(byRun.Events) != 1 {
+		t.Errorf("expected run_id filter to match the event, got %+v", byRun)
+	}
+
+	// Malformed reports are rejected with an error, not silently dropped.
+	if bad := c2.send(t, Request{Cmd: "report", ID: eval.EventID}); bad.OK {
+		t.Error("expected report without an outcome to fail")
+	}
+	if bad := c2.send(t, Request{Cmd: "report", Outcome: &Outcome{Status: OutcomeSuccess}}); bad.OK {
+		t.Error("expected report without an id to fail")
 	}
 }

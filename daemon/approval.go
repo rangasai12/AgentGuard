@@ -51,7 +51,7 @@ type Notifier func(PendingApproval)
 // which case onTimeout is returned. The pending entry is removed before
 // Await returns.
 func (b *ApprovalBroker) Await(actor string, action engine.Action, decision engine.Decision, timeout time.Duration, onTimeout engine.Result, notify Notifier) (engine.Result, string) {
-	id := newApprovalID()
+	id := newHexID(4)
 	entry := &pendingEntry{
 		summary: PendingApproval{
 			ID:          id,
@@ -115,8 +115,11 @@ func (b *ApprovalBroker) List() []PendingApproval {
 	return out
 }
 
-func newApprovalID() string {
-	buf := make([]byte, 4)
+// newHexID returns nBytes of randomness as lowercase hex — 4 bytes for an
+// approval id (short enough to type after `agentctl approve`), 8 for an
+// audit event id (correlated by machines, not humans).
+func newHexID(nBytes int) string {
+	buf := make([]byte, nBytes)
 	_, _ = rand.Read(buf)
 	return hex.EncodeToString(buf)
 }

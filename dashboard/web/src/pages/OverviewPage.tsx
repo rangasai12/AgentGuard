@@ -8,8 +8,11 @@ import { AgentStatusBadge, isAgentOnline } from "../components/AgentStatusBadge"
 import { MiniStat } from "../components/MiniStat";
 import { Sparkline } from "../components/Sparkline";
 import { Avatar } from "../components/Avatar";
+import { RankList } from "../components/RankList";
+import { StatCard } from "../components/StatCard";
+import { AnomalyList } from "../components/AnomalyList";
 import { timeAgo } from "../lib/time";
-import type { Agent, AuditEvent, Metrics, ResourceCount } from "../api/types";
+import type { Agent, Anomaly, AuditEvent, Metrics } from "../api/types";
 
 const HOUR_MS = 60 * 60 * 1000;
 
@@ -20,6 +23,16 @@ function emptyMetrics(): Metrics {
     require_approval_count: 0,
     top_denied_resources: null,
     top_denied_rules: null,
+    total_count: 0,
+    reported_count: 0,
+    error_count: 0,
+    distinct_resources: 0,
+    by_action_type: null,
+    top_resources: null,
+    exec_p50_ms: null,
+    exec_p95_ms: null,
+    exec_samples: 0,
+    events_per_hour: 0,
   };
 }
 
@@ -43,9 +56,11 @@ function bucketHourly(events: AuditEvent[], hours: number): number[] {
 }
 
 export function OverviewPage() {
-  const { currentTenantId } = useAuth();
+  const { currentTenantId, currentMembership } = useAuth();
+  const isAdmin = currentMembership?.role === "admin";
   const [since, setSince] = useState("");
   const [until, setUntil] = useState("");
+  const [ackError, setAckError] = useState<string | null>(null);
 
   const fetcher = useCallback(async () => {
     if (!currentTenantId) {
@@ -56,6 +71,7 @@ export function OverviewPage() {
         agents: [] as Agent[],
         hourly: [] as AuditEvent[],
         recent: [] as AuditEvent[],
+        anomalies: [] as Anomaly[],
       };
     }
 
@@ -63,17 +79,17 @@ export function OverviewPage() {
     const h24Ago = new Date(now.getTime() - 24 * HOUR_MS);
     const h48Ago = new Date(now.getTime() - 48 * HOUR_MS);
 
-    const [rangeMetrics, last24h, prev24h, agentsResult, hourlyResult, recentResult] = await Promise.all([
-      api.metrics(
-        currentTenantId,
-        since ? new Date(since).toISOString() : undefined,
-        until ? new Date(until).toISOString() : undefined,
-      ),
-      api.metrics(currentTenantId, h24Ago.toISOString(), now.toISOString()),
-      api.metrics(currentTenantId, h48Ago.toISOString(), h24Ago.toISOString()),
+    const [rangeMetrics, last24h, prev24h, agentsResult, hourlyResult, recentResult, anomaliesResult] = await Promise.all([
+      api.metrics(currentTenantId, {
+        since: since ? new Date(since).toISOString() : undefined,
+        until: until ? new Date(until).toISOString() : undefined,
+      }),
+      api.metrics(currentTenantId, { since: h24Ago.toISOString(), until: now.toISOString() }),
+      api.metrics(currentTenantId, { since: h48Ago.toISOString(), until: h24Ago.toISOString() }),
       api.listAgents(currentTenantId),
       api.listEvents(currentTenantId, { since: h24Ago.toISOString(), limit: 500 }),
       api.listEvents(currentTenantId, { limit: 8 }),
+      api.listAnomalies(currentTenantId, { unacknowledged: true }),
     ]);
 
     return {
@@ -83,6 +99,7 @@ export function OverviewPage() {
       agents: agentsResult.agents ?? [],
       hourly: hourlyResult.events ?? [],
       recent: recentResult.events ?? [],
+      anomalies: (anomaliesResult.anomalies ?? []).slice(0, 8),
     };
   }, [currentTenantId, since, until]);
 
@@ -105,6 +122,17 @@ export function OverviewPage() {
   const hourlyVolume = data ? bucketHourly(data.hourly, 24) : [];
   const topRule = data?.last24h.top_denied_rules?.[0] ?? null;
   const isFiltered = Boolean(since || until);
+
+  async function ackAnomaly(id: string) {
+    if (!currentTenantId) return;
+    setAckError(null);
+    try {
+      await api.ackAnomaly(currentTenantId, id);
+      refetch();
+    } catch (err) {
+      setAckError(err instanceof Error ? err.message : "Failed to acknowledge anomaly.");
+    }
+  }
 
   const recentAgents = [...agents]
     .sort((a, b) => {
@@ -264,52 +292,25 @@ export function OverviewPage() {
                 </ul>
               )}
             </div>
+
+            <div className="panel">
+              <div className="panel-header">
+                <h2>Anomalies</h2>
+                <Link to="/settings" className="panel-link">
+                  Tune thresholds →
+                </Link>
+              </div>
+              {ackError && <div className="form-error">{ackError}</div>}
+              <AnomalyList
+                anomalies={data?.anomalies ?? []}
+                showAgent
+                isAdmin={isAdmin}
+                onAck={ackAnomaly}
+                emptyLabel="No unacknowledged anomalies."
+              />
+            </div>
           </div>
         </>
-      )}
-    </div>
-  );
-}
-
-function StatCard({
-  label,
-  value,
-  color,
-  total,
-}: {
-  label: string;
-  value: number;
-  color: "allow" | "deny" | "approval";
-  total: number;
-}) {
-  const pct = total > 0 ? Math.round((value / total) * 100) : 0;
-  return (
-    <div className={`stat-card stat-${color}`}>
-      <div className="stat-value">{value.toLocaleString()}</div>
-      <div className="stat-label">{label}</div>
-      <div className="stat-bar-track">
-        <div className="stat-bar-fill" style={{ width: `${pct}%` }} />
-      </div>
-      <div className="stat-pct">{pct}%</div>
-    </div>
-  );
-}
-
-function RankList({ title, items }: { title: string; items: ResourceCount[] | null }) {
-  return (
-    <div className="rank-list">
-      <h2>{title}</h2>
-      {!items || items.length === 0 ? (
-        <div className="empty-state small">No data yet.</div>
-      ) : (
-        <ol>
-          {items.map((item) => (
-            <li key={item.value}>
-              <span className="rank-value">{item.value}</span>
-              <span className="rank-count">{item.count.toLocaleString()}</span>
-            </li>
-          ))}
-        </ol>
       )}
     </div>
   );

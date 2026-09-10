@@ -124,11 +124,15 @@ func (h *harness) readClientResponse(t *testing.T) map[string]any {
 }
 
 func toolCallRequest(id, tool string) map[string]any {
+	return toolCallRequestWithArgs(id, tool, map[string]any{})
+}
+
+func toolCallRequestWithArgs(id, tool string, args map[string]any) map[string]any {
 	return map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  "tools/call",
-		"params":  map[string]any{"name": tool, "arguments": map[string]any{}},
+		"params":  map[string]any{"name": tool, "arguments": args},
 	}
 }
 
@@ -138,14 +142,122 @@ func TestProxyForwardsAllowedToolCall(t *testing.T) {
 		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"ok": true}}, true
 	})
 
-	h.sendClient(t, toolCallRequest("1", "list_transactions"))
+	p.RunID, p.AgentVersion = "run-7", "3.1"
+	h.sendClient(t, toolCallRequestWithArgs("1", "list_transactions", map[string]any{"account": "acc_123", "limit": 5}))
 	resp := h.readClientResponse(t)
 	if _, isError := resp["error"]; isError {
 		t.Fatalf("expected the allowed call to be forwarded and succeed, got %+v", resp)
 	}
 	events := audit.Tail(10)
 	if len(events) != 1 || events[0].Decision != engine.Allow {
-		t.Errorf("expected one Allow audit event, got %+v", events)
+		t.Fatalf("expected one Allow audit event, got %+v", events)
+	}
+	ev := events[0]
+	if ev.Action == nil || ev.Action.Args["account"] != "acc_123" || ev.Action.Args["limit"] != float64(5) {
+		t.Errorf("expected the tool call's arguments on the audit event, got %+v", ev.Action)
+	}
+	if ev.RunID != "run-7" || ev.AgentVersion != "3.1" || ev.EventID == "" {
+		t.Errorf("expected run/version/event identity on the audit event, got %+v", ev)
+	}
+	// The proxy observed the server's response on its way back to the
+	// client (before forwarding it), so the outcome is already recorded.
+	if ev.Outcome == nil || ev.Outcome.Status != daemon.OutcomeSuccess {
+		t.Fatalf("expected a success outcome reported from the server's response, got %+v", ev.Outcome)
+	}
+	if !strings.Contains(ev.Outcome.Output, `"ok":true`) || ev.Outcome.OutputBytes == 0 || ev.Outcome.OutputSHA256 == "" {
+		t.Errorf("expected the result preview, size, and hash on the outcome, got %+v", ev.Outcome)
+	}
+}
+
+func TestProxyAttachesToolDescriptionOnce(t *testing.T) {
+	p, audit := newTestProxy(t, nil)
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		if req.Method == "tools/list" {
+			return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"tools": []map[string]any{
+				{"name": "list_transactions", "description": "List a customer's recent transactions."},
+				{"name": "charge_customer", "description": "Charge a card."},
+			}}}, true
+		}
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"ok": true}}, true
+	})
+
+	// tools/list passes through and is answered normally...
+	h.sendClient(t, map[string]any{"jsonrpc": "2.0", "id": "l1", "method": "tools/list"})
+	listResp := h.readClientResponse(t)
+	if _, ok := listResp["result"]; !ok {
+		t.Fatalf("tools/list response was not relayed: %+v", listResp)
+	}
+	// ...and the next two calls to the same tool carry the description once.
+	h.sendClient(t, toolCallRequest("1", "list_transactions"))
+	h.readClientResponse(t)
+	h.sendClient(t, toolCallRequest("2", "list_transactions"))
+	h.readClientResponse(t)
+
+	events := audit.Tail(10)
+	if len(events) != 2 {
+		t.Fatalf("expected two audit events, got %+v", events)
+	}
+	if events[0].Action == nil || events[0].Action.Description != "List a customer's recent transactions." {
+		t.Fatalf("first call should carry the tool description, got %+v", events[0].Action)
+	}
+	if events[1].Action == nil || events[1].Action.Description != "" {
+		t.Fatalf("second call must not repeat the description, got %+v", events[1].Action)
+	}
+}
+
+func TestProxyRecordsErrorOutcomeFromJSONRPCError(t *testing.T) {
+	p, audit := newTestProxy(t, nil)
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		if string(req.ID) == `"err-rpc"` {
+			return map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32603, "message": "upstream exploded"}}, true
+		}
+		// A tool-level failure: JSON-RPC success carrying result.isError.
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"isError": true, "content": []any{map[string]any{"type": "text", "text": "no such account"}}}}, true
+	})
+
+	h.sendClient(t, toolCallRequest("err-rpc", "list_transactions"))
+	h.readClientResponse(t)
+	h.sendClient(t, toolCallRequest("err-tool", "list_transactions"))
+	h.readClientResponse(t)
+
+	events := audit.Tail(10)
+	if len(events) != 2 {
+		t.Fatalf("expected two audit events, got %+v", events)
+	}
+	if o := events[0].Outcome; o == nil || o.Status != daemon.OutcomeError || !strings.Contains(o.Error, "upstream exploded") {
+		t.Errorf("expected a JSON-RPC error to be recorded as an error outcome with the error body, got %+v", o)
+	}
+	if o := events[1].Outcome; o == nil || o.Status != daemon.OutcomeError || !strings.Contains(o.Output, "no such account") {
+		t.Errorf("expected result.isError to be recorded as an error outcome with the result preview, got %+v", o)
+	}
+}
+
+func TestProxyDeniedCallHasNoOutcome(t *testing.T) {
+	p, audit := newTestProxy(t, nil)
+	h := startHarness(t, p, func(req rpcMessage) (any, bool) {
+		return map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": map[string]any{"ok": true}}, true
+	})
+
+	h.sendClient(t, toolCallRequest("9", "refund_customer"))
+	h.readClientResponse(t)
+	// A server-originated *request* to the client that happens to reuse the
+	// same id must not be mistaken for a response to the denied (never
+	// forwarded) call, nor for anything else in flight.
+	h.sendClient(t, map[string]any{"jsonrpc": "2.0", "id": "ping-1", "method": "ping"})
+	h.readClientResponse(t)
+
+	events := audit.Tail(10)
+	if len(events) != 1 || events[0].Decision != engine.Deny {
+		t.Fatalf("expected exactly one Deny audit event, got %+v", events)
+	}
+	if events[0].Outcome != nil {
+		t.Errorf("a denied call never ran, so it must have no outcome, got %+v", events[0].Outcome)
+	}
+	p.mu.Lock()
+	n := len(p.inflight)
+	p.mu.Unlock()
+	if n != 0 {
+		t.Errorf("nothing should be left in flight, got %d", n)
 	}
 }
 

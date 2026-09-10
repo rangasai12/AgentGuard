@@ -6,6 +6,7 @@ import { AgentsPage } from "./pages/AgentsPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { EventsPage } from "./pages/EventsPage";
 import { PendingPage } from "./pages/PendingPage";
+import { SettingsPage } from "./pages/SettingsPage";
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
         <Route path="/overview" element={<OverviewPage />} />
         <Route path="/events" element={<EventsPage />} />
         <Route path="/pending" element={<PendingPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
         <Route path="/" element={<Navigate to="/agents" replace />} />
       </Route>
 
