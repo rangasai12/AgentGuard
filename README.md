@@ -1,13 +1,16 @@
 # AgentGuard
 
-A developer-first **policy-as-code layer for AI agents**. Declare exactly what an
-agent's tool calls are allowed to touch — files, network domains, shell commands,
-MCP tools, secrets — in a version-controlled `policy.yaml`, and have it **enforced
-at the point of action**, not logged about after the fact.
+**Observability for AI agents.** See exactly what every agent's tools are
+doing — arguments, outputs, timing, and effect — with automatic per-agent
+behavioral profiles, version-to-version change detection, and rules-free
+anomaly detection the moment behavior drifts. A built-in policy-as-code
+enforcement layer (`allow` / `deny` / `require_approval`) lets you act on
+what you see, at the point of action, when you're ready to — visibility
+doesn't require turning enforcement on.
 
 Everything runs locally by default (no dependency on AgentGuard's infrastructure to
-enforce a decision) with an optional hosted dashboard for fleet-wide visibility
-across every agent a company runs, across multiple companies.
+capture or enforce anything) with an optional hosted dashboard for fleet-wide
+behavioral visibility across every agent a company runs, across multiple companies.
 
 ## Screenshots
 
@@ -24,32 +27,48 @@ across every agent a company runs, across multiple companies.
 
 ## Why
 
-Most "AI security" tools today either detect-and-alert after something already
-happened, or isolate an agent in a sandbox with no policy layer at all. AgentGuard
-sits in between: a single policy decision point (PDP) that every enforcement
-surface — an SDK-wrapped tool call, an MCP proxy, a network egress proxy, a
-hardened shell — calls into before an action runs, so a rule is defined once and
-enforced everywhere.
+Most tools for understanding what an AI agent is actually doing are either
+raw, unstructured logging with no notion of "normal" for this agent, or a
+security sandbox that isolates an agent with no visibility into its behavior
+at all. AgentGuard gives every tool call a structured, comparable shape —
+action, arguments, output, timing, run, and agent version — the instant it
+happens, so you can see what an agent normally does, get told the moment it
+deviates, and, if you choose, stop the deviation before it executes rather
+than just recording it afterward.
 
 ## Key features
 
-- **Policy-as-code**: one YAML file governs filesystem, network, shell, MCP tool,
-  and secret-handling rules, with `allow` / `deny` / `require_approval` outcomes.
-- **Enforced at the point of action**, across four surfaces: an SDK tool-call
-  wrapper (Python & TypeScript), an MCP stdio proxy, a TLS-intercepting network
-  egress proxy, and OS-level hardening (macOS `sandbox-exec`).
-- **Human-in-the-loop approvals**: risky actions can pause for a real approval,
-  resolved via the CLI, Slack/webhook, or the cloud dashboard's browser UI.
+- **Per-agent behavioral profiles**: for each agent, and each version of it,
+  see what it touches, its read/write/delete/permission mix, error rates,
+  and call latency — and how that compares to its previous version.
+- **Rules-free anomaly detection**: automatically flags new footprints, shifts
+  in what an agent does, abnormal call volume, and abnormally large outputs —
+  measured against the agent's own rolling baseline. Nothing to hand-tune to
+  get started, though every threshold is tenant-configurable if you want to.
+- **Full-fidelity event capture**: every tool call's arguments, output preview,
+  execution time, and outcome — not just an allow/deny line — correlated by
+  run and by agent version.
+- **Automatic tool classification**: tools are classified by effect
+  (read/write/delete/permission) from their name and description via an LLM
+  with a heuristic fallback, so profiles and anomaly detection work without
+  manually tagging every tool.
+- **Policy-as-code enforcement, built in when you want it**: one YAML file
+  governs filesystem, network, shell, MCP tool, and secret-handling rules,
+  enforced at the point of action across four surfaces — an SDK-wrapped tool
+  call, an MCP proxy, a network egress proxy, or OS-level hardening — with
+  `allow` / `deny` / `require_approval` outcomes and human-in-the-loop
+  approval via the CLI, Slack/webhook, or the dashboard.
 - **CI-testable policies**: `agentctl policy test` runs a policy against a
   recorded set of traces so a policy change gets regression-tested like code.
-- **Multi-tenant cloud dashboard**: fleet-wide event feed, metrics, and remote
-  approve/deny across every agent a company runs — strictly additive, so the
-  local daemon keeps enforcing policy even if the cloud is unreachable.
+- **Multi-tenant cloud dashboard**: fleet-wide live feed, behavioral profiles,
+  anomalies, and metrics across every agent a company runs — strictly
+  additive, so the local daemon keeps capturing and enforcing even if the
+  cloud is unreachable.
 
 ## Architecture
 
 ```
- Agent process                          AgentGuard (local, always-on enforcement)
+ Agent process                          AgentGuard (local, always-on capture + enforcement)
  ──────────────                         ─────────────────────────────────────────
  Python/TS SDK  ──┐
  MCP client     ──┼── enforcement ──▶   local daemon (Unix socket)
@@ -66,6 +85,7 @@ enforced everywhere.
                                           ▼
                               AgentGuard Cloud (hosted, multi-tenant)
                               Control API + Web API + Postgres + React dashboard
+                              behavioral profiles, tool classification, anomaly detection
 ```
 
 ## Repo layout
@@ -163,8 +183,10 @@ go run ./cmd/agentguard-forwarder -register-token=<token from the dashboard>
 
 Open the frontend's dev server URL, sign up, and add an agent — the forwarder
 ships that machine's audit log and relays browser approve/deny decisions back to
-its local daemon. The cloud is strictly additive: local enforcement keeps working
-even if it's unreachable.
+its local daemon. Behavioral profiles, tool classification, and anomaly
+detection run automatically as events arrive, no setup required. The cloud is
+strictly additive: local capture and enforcement keep working even if it's
+unreachable.
 
 ## Contributing
 
@@ -183,8 +205,12 @@ cd dashboard/web && npm run build
 
 ## Status
 
-Actively developed. Local enforcement (v0.1/v0.2: policy engine, daemon, MCP
+Actively developed. Local capture and enforcement (policy engine, daemon, MCP
 proxy, network proxy, CLI, Python/TS SDKs, macOS hardened mode, CI policy
-testing, Slack/webhook approvals) is built and tested. The cloud dashboard is
-Phase 1 (multi-tenant backend + forwarder + React frontend); see `CHANGELOG.md`
-for the full build log and design rationale behind every piece.
+testing, Slack/webhook approvals) is built and tested. The cloud dashboard's
+multi-tenant backend, forwarder, React frontend, full-fidelity event capture,
+agent versioning, per-agent behavioral profiles, automatic tool
+classification, and rules-free anomaly detection with tenant-configurable
+thresholds are built and tested. Run grouping, real-time cloud alerting,
+additional framework adapters, and a compliance export are not yet built; see
+`CHANGELOG.md` for the full build log and design rationale behind every piece.
