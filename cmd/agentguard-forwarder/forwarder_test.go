@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/cli"
-	"agentguard/daemon"
-	"agentguard/dashboard/server"
-	"agentguard/dashboard/store"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/cli"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/dashboard/server"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // This test drives the real local daemon over a real Unix socket, a real
@@ -67,7 +67,7 @@ func newTestDaemonOnSocket(t *testing.T) (d *daemon.Daemon, socketPath, auditLog
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go func() { _ = daemon.Serve(ctx, socketPath, d) }()
+	go func() { _ = daemon.Serve(ctx, socketPath, d, false) }()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -207,23 +207,59 @@ func TestReadNewEventsBatches(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	first, off1, err := readNewEvents(path, 0, 2)
-	if err != nil || len(first) != 2 || first[1].Resource != "cmd1" {
-		t.Fatalf("first batch: %+v off=%d err=%v", first, off1, err)
+	first, off1, hasMore1, err := readNewEvents(path, 0, 2, 0)
+	if err != nil || len(first) != 2 || first[1].Resource != "cmd1" || !hasMore1 {
+		t.Fatalf("first batch: %+v off=%d hasMore=%v err=%v", first, off1, hasMore1, err)
 	}
-	second, off2, err := readNewEvents(path, off1, 2)
-	if err != nil || len(second) != 2 || second[0].Resource != "cmd2" {
-		t.Fatalf("second batch must resume exactly after the first: %+v err=%v", second, err)
+	second, off2, hasMore2, err := readNewEvents(path, off1, 2, 0)
+	if err != nil || len(second) != 2 || second[0].Resource != "cmd2" || !hasMore2 {
+		t.Fatalf("second batch must resume exactly after the first: %+v hasMore=%v err=%v", second, hasMore2, err)
 	}
-	third, off3, err := readNewEvents(path, off2, 2)
-	if err != nil || len(third) != 1 || third[0].Resource != "cmd4" {
-		t.Fatalf("third batch: %+v err=%v", third, err)
+	third, off3, hasMore3, err := readNewEvents(path, off2, 2, 0)
+	if err != nil || len(third) != 1 || third[0].Resource != "cmd4" || hasMore3 {
+		t.Fatalf("third batch: %+v hasMore=%v err=%v", third, hasMore3, err)
 	}
-	if rest, _, _ := readNewEvents(path, off3, 2); len(rest) != 0 {
+	if rest, _, _, _ := readNewEvents(path, off3, 2, 0); len(rest) != 0 {
 		t.Fatalf("expected nothing after the log is drained, got %+v", rest)
 	}
-	if all, _, _ := readNewEvents(path, 0, 0); len(all) != 5 {
+	if all, _, _, _ := readNewEvents(path, 0, 0, 0); len(all) != 5 {
 		t.Fatalf("maxEvents <= 0 must mean unbounded, got %d", len(all))
+	}
+}
+
+// TestReadNewEventsRespectsByteBudget: the forwarder's batch size must be
+// bounded by raw bytes as well as event count, so a batch's size under
+// the cloud's maxIngestBytes stays true structurally, not just by luck at
+// today's fixed output-preview size (see CHANGELOG "Fix 5").
+func TestReadNewEventsRespectsByteBudget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	var lines []string
+	for i := 0; i < 5; i++ {
+		lines = append(lines, `{"timestamp":"2026-09-09T00:00:0`+string(rune('0'+i))+`Z","action_type":"shell","resource":"cmd`+string(rune('0'+i))+`","decision":"allow","matched_rule":"r"}`)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lineLen := int64(len(lines[0]))
+
+	// A byte budget of a little over two lines' worth caps the batch at 2
+	// events, well under the count cap (10), and reports more remain.
+	first, off1, hasMore, err := readNewEvents(path, 0, 10, 2*lineLen+1)
+	if err != nil || len(first) != 2 || !hasMore {
+		t.Fatalf("expected exactly 2 events and hasMore=true, got %+v hasMore=%v err=%v", first, hasMore, err)
+	}
+
+	// The byte budget never blocks forward progress: even a budget smaller
+	// than one line still ships that one line rather than stalling forever.
+	oneShort, _, hasMore, err := readNewEvents(path, 0, 10, 1)
+	if err != nil || len(oneShort) != 1 || !hasMore {
+		t.Fatalf("expected exactly 1 event despite an under-sized budget, got %+v hasMore=%v err=%v", oneShort, hasMore, err)
+	}
+
+	// Draining the whole file (byte budget large enough) reports no more.
+	all, _, hasMore, err := readNewEvents(path, off1, 10, 10*lineLen)
+	if err != nil || len(all) != 3 || hasMore {
+		t.Fatalf("expected the remaining 3 events and hasMore=false, got %+v hasMore=%v err=%v", all, hasMore, err)
 	}
 }
 

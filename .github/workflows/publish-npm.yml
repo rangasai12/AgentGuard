@@ -1,0 +1,22 @@
+name: publish-npm
+
+# Manual only — see publish-python.yml's note and RELEASING.md. Requires
+# an NPM_TOKEN repository secret. Ships src/ as-is per sdk-ts/package.json's
+# "files" field (raw TypeScript, no build step — see RELEASING.md /
+# CHANGELOG "Fix 4" for why: matches the SDK's native-Node-execution design).
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.6"
+          registry-url: "https://registry.npmjs.org"
+      - run: cd sdk-ts && npm test
+      - run: cd sdk-ts && npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

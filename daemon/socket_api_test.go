@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // shortSocketPath returns a Unix domain socket path under /tmp rather than
@@ -85,11 +85,12 @@ func startTestServer(t *testing.T) (*Daemon, string) {
 		t.Fatalf("NewAuditLogger: %v", err)
 	}
 	d := New(policy, audit)
+	d.PolicyPath = "test-policy.yaml"
 
 	socketPath := shortSocketPath(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, socketPath, d) }()
+	go func() { errCh <- Serve(ctx, socketPath, d, false) }()
 	t.Cleanup(func() {
 		cancel()
 		_ = audit.Close()
@@ -98,11 +99,81 @@ func startTestServer(t *testing.T) (*Daemon, string) {
 }
 
 func TestSocketAPIPing(t *testing.T) {
-	_, socketPath := startTestServer(t)
+	d, socketPath := startTestServer(t)
 	c := dialTestDaemon(t, socketPath)
 	resp := c.send(t, Request{Cmd: "ping"})
 	if !resp.OK {
 		t.Fatalf("expected ok ping response, got %+v", resp)
+	}
+	if resp.PolicyHash == "" || resp.PolicyHash != d.Policy().Hash {
+		t.Fatalf("expected ping to report the daemon's policy hash %q, got %+v", d.Policy().Hash, resp)
+	}
+	if resp.PolicyPath != "test-policy.yaml" {
+		t.Fatalf("expected ping to report the daemon's policy path, got %+v", resp)
+	}
+}
+
+// TestServeRefusesToClobberALiveDaemon guards against the bug this was
+// written to fix: a second `daemon start` on an already-occupied socket
+// path used to silently os.RemoveAll the first daemon's socket and take
+// over, orphaning it rather than erroring. Serve must now refuse unless
+// force is true.
+func TestServeRefusesToClobberALiveDaemon(t *testing.T) {
+	policy, err := engine.ParsePolicy([]byte(daemonTestPolicy))
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	audit1, err := NewAuditLogger(filepath.Join(t.TempDir(), "audit.log"))
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	t.Cleanup(func() { _ = audit1.Close() })
+	d1 := New(policy, audit1)
+	d1.PolicyPath = "first.yaml"
+
+	socketPath := shortSocketPath(t)
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	t.Cleanup(cancel1)
+	go func() { _ = Serve(ctx1, socketPath, d1, false) }()
+	dialTestDaemon(t, socketPath).conn.Close() // wait for it to come up
+
+	audit2, err := NewAuditLogger(filepath.Join(t.TempDir(), "audit.log"))
+	if err != nil {
+		t.Fatalf("NewAuditLogger: %v", err)
+	}
+	t.Cleanup(func() { _ = audit2.Close() })
+	d2 := New(policy, audit2)
+	d2.PolicyPath = "second.yaml"
+
+	if err := Serve(context.Background(), socketPath, d2, false); err == nil {
+		t.Fatal("expected Serve to refuse to start over a live daemon without force")
+	}
+
+	// The first daemon must still be reachable — not orphaned by an
+	// unlink the refused second Serve call should never have performed.
+	resp := dialTestDaemon(t, socketPath).send(t, Request{Cmd: "ping"})
+	if resp.PolicyPath != "first.yaml" {
+		t.Fatalf("expected the original daemon to still be serving, got %+v", resp)
+	}
+
+	// force:true still takes over, matching today's documented escape hatch.
+	// Serve's os.RemoveAll+Listen races the still-running first daemon's
+	// listener on the same path (it isn't told to stop), so poll for the
+	// takeover to actually complete rather than trusting the first
+	// successful dial.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	t.Cleanup(cancel2)
+	go func() { _ = Serve(ctx2, socketPath, d2, true) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp = dialTestDaemon(t, socketPath).send(t, Request{Cmd: "ping"})
+		if resp.PolicyPath == "second.yaml" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected --force to take over the socket, got %+v", resp)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

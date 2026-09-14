@@ -5,6 +5,8 @@
 // calls the same Evaluate function so policy is defined once and enforced everywhere.
 package engine
 
+import "fmt"
+
 // ActionType identifies the category of action being evaluated.
 type ActionType string
 
@@ -84,6 +86,58 @@ type Decision struct {
 	Result      Result `json:"result"`
 	MatchedRule string `json:"matched_rule"` // human-readable description of the rule that decided this, or "default-deny"/"default-allow"
 	Reason      string `json:"reason,omitempty"`
+}
+
+// Validate checks that the fields required to evaluate this action's Type
+// are actually set, so a malformed or incomplete Action (an SDK caller
+// that forgot a field, a hand-built test action) fails fast with a
+// specific message naming the missing field, rather than reaching that
+// type's matcher with an empty one and falling through to whatever that
+// type's *default* decision happens to be. For most types that default is
+// deny (just a wasted round trip with a confusing generic reason); for
+// secret_env, whose default is *allow* (see evaluateSecret), an
+// unvalidated empty EnvVar would be a silent policy bypass, not just a
+// confusing error — this is what actually closes that gap, since Evaluate
+// calls Validate before any type-specific evaluator runs.
+//
+// An unrecognized Type is not this function's concern: Evaluate's own
+// switch already denies it by name ("no policy section handles action
+// type ..."), so duplicating that check here would just be a second place
+// saying the same thing.
+func (a Action) Validate() error {
+	switch a.Type {
+	case ActionFSRead, ActionFSWrite:
+		if a.Path == "" {
+			return fmt.Errorf("action.path is required for %s actions", a.Type)
+		}
+	case ActionNetwork:
+		if a.Domain == "" {
+			return fmt.Errorf("action.domain is required for network actions")
+		}
+		if a.Method == "" {
+			return fmt.Errorf("action.method is required for network actions")
+		}
+	case ActionShell:
+		if a.Command == "" {
+			return fmt.Errorf("action.command is required for shell actions")
+		}
+	case ActionMCPTool:
+		if a.Server == "" {
+			return fmt.Errorf("action.server is required for mcp_tool actions")
+		}
+		if a.Tool == "" {
+			return fmt.Errorf("action.tool is required for mcp_tool actions")
+		}
+	case ActionFunction:
+		if a.Name == "" {
+			return fmt.Errorf("action.name is required for function actions")
+		}
+	case ActionSecretEnv:
+		if a.EnvVar == "" {
+			return fmt.Errorf("action.env_var is required for secret_env actions")
+		}
+	}
+	return nil
 }
 
 // Resource returns a short human-readable description of the thing this action

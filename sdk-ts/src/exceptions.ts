@@ -17,3 +17,21 @@ export class PolicyDenied extends Error {
     this.decision = decision;
   }
 }
+
+/**
+ * Raised by Guard.ensureDaemon when a daemon answers ping at the expected
+ * socket, but its reported policy_hash does not match this Guard's own
+ * policy file read fresh from disk. Neither a PolicyDenied (a decision)
+ * nor a DaemonUnavailable (a connection failure) — the daemon is up and
+ * healthy, just running stale or unrelated policy content at this socket
+ * path, most often because the policy file was edited after its daemon
+ * started. Distinct from a cross-project collision, which
+ * cli.DefaultSocketPath's policy-scoped default prevents structurally
+ * rather than merely detecting.
+ */
+export class DaemonPolicyMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DaemonPolicyMismatchError";
+  }
+}

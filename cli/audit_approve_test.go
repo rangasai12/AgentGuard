@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/daemon"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // shortSocketPath returns a socket path under /tmp rather than t.TempDir(),
@@ -53,7 +53,7 @@ func startTestDaemonForCLI(t *testing.T) (socketPath string, d *daemon.Daemon) {
 
 	socketPath = shortSocketPath(t)
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() { _ = daemon.Serve(ctx, socketPath, d) }()
+	go func() { _ = daemon.Serve(ctx, socketPath, d, false) }()
 	t.Cleanup(func() {
 		cancel()
 		_ = audit.Close()

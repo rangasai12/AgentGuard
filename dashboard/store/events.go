@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // IngestedEvent is what a forwarder sends upstream for one locally-recorded

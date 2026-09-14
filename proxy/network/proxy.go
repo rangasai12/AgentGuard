@@ -20,9 +20,9 @@ import (
 	"sync"
 	"time"
 
-	"agentguard/approval"
-	"agentguard/daemon"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/approval"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // Proxy is an HTTP/HTTPS forward proxy that evaluates every request against

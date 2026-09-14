@@ -31,7 +31,7 @@ POLICY_PATH = str(EXAMPLE_DIR / "policy.yaml")
 
 _agentctl = Path(tempfile.mkdtemp()) / "agentctl"
 subprocess.run(
-    ["go", "build", "-o", str(_agentctl), "agentguard/cli/cmd/agentctl"],
+    ["go", "build", "-o", str(_agentctl), "./cli/cmd/agentctl"],
     cwd=REPO_ROOT,
     check=True,
 )

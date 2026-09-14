@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 func policyAllowingWrite(t *testing.T, dir string) *engine.Policy {

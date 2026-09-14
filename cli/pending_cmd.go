@@ -6,7 +6,7 @@ import (
 	"io"
 	"time"
 
-	"agentguard/daemon"
+	"github.com/rangasai12/AgentGuard/daemon"
 )
 
 // runPending lists actions currently blocked awaiting a human decision, so a
@@ -16,7 +16,7 @@ import (
 func runPending(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("pending", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	socketPath := fs.String("socket", DefaultSocketPath(), "unix socket path")
+	socketPath := fs.String("socket", DefaultSocketPath("policy.yaml"), "unix socket path (default: derived from ./policy.yaml, matching `daemon start`'s default)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}

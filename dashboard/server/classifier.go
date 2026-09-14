@@ -23,8 +23,8 @@ import (
 	"strings"
 	"time"
 
-	"agentguard/dashboard/store"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 var validVerbs = map[string]bool{

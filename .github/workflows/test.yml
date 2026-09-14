@@ -1,0 +1,56 @@
+name: test
+
+# Runs exactly the commands docs/conventions.md's "Running the tests"
+# section already tells a contributor to run by hand — this workflow
+# enforces that contract, it doesn't invent a second one.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agentguard_dashboard_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      AGENTGUARD_DASHBOARD_TEST_DB: postgres://postgres:postgres@localhost:5432/agentguard_dashboard_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -p 1 ./...
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install -e ./sdk-python
+      - run: cd sdk-python && pytest -q
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.6"
+      - run: cd sdk-ts && npm test
+      - run: cd dashboard/web && npm ci && npm run build

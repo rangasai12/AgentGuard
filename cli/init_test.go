@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 func TestRunInitWritesValidPolicy(t *testing.T) {

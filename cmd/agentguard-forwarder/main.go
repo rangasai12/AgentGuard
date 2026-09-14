@@ -33,9 +33,9 @@ import (
 	"os"
 	"time"
 
-	"agentguard/cli"
-	"agentguard/daemon"
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/cli"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 func main() {
@@ -47,13 +47,27 @@ func main() {
 
 func run() error {
 	controlAPI := flag.String("control-api", envOr("AGENTGUARD_CONTROL_API", "http://127.0.0.1:8090"), "base URL of the agentguard-cloud Control API")
-	socketPath := flag.String("socket", cli.DefaultSocketPath(), "local daemon unix socket path")
-	auditLogPath := flag.String("audit-log", cli.DefaultAuditLogPath(), "local daemon JSONL audit log path")
-	statePath := flag.String("state", envOr("AGENTGUARD_FORWARDER_STATE", cli.DefaultSocketPath()+".forwarder-state.json"), "path to persist this forwarder's api key and audit-log read offset")
+	// cli.DefaultSocketPath/DefaultAuditLogPath take a policy path to scope
+	// their default under (see cli/paths.go) — this process never loads a
+	// policy itself, so "" gets the single pre-scoping global path; a
+	// forwarder shipping for a policy-scoped daemon must be pointed at it
+	// explicitly via --socket/--audit-log.
+	socketPath := flag.String("socket", cli.DefaultSocketPath(""), "local daemon unix socket path")
+	auditLogPath := flag.String("audit-log", cli.DefaultAuditLogPath(""), "local daemon JSONL audit log path")
+	statePath := flag.String("state", envOr("AGENTGUARD_FORWARDER_STATE", ""), "path to persist this forwarder's api key and audit-log read offset (default: derived from --audit-log)")
 	registerToken := flag.String("register-token", "", "one-time registration token from the dashboard's \"Add Agent\" flow; redeemed once and then ignored on later runs")
 	pollInterval := flag.Duration("poll-interval", 2*time.Second, "how often to sync pending approvals and check for resolutions")
 	once := flag.Bool("once", false, "run a single sync cycle and exit, instead of looping forever (for tests/scripting)")
 	flag.Parse()
+
+	if *statePath == "" {
+		// Derived from the audit log actually being tailed, not a fresh
+		// call to the global default — two forwarders each pointed at a
+		// different --audit-log (e.g. two policy-scoped daemons) must not
+		// collide on one shared state file and overwrite each other's
+		// api_key/agent_id and read offset.
+		*statePath = *auditLogPath + ".forwarder-state.json"
+	}
 
 	st, err := loadState(*statePath)
 	if err != nil {
@@ -217,7 +231,7 @@ func (f *forwarder) relayResolutions() error {
 // preview and an unbounded backlog would otherwise become one huge POST.
 func (f *forwarder) shipNewEvents() error {
 	for {
-		events, newOffset, err := readNewEvents(f.auditLogPath, f.state.Offset, maxShipBatch)
+		events, newOffset, hasMore, err := readNewEvents(f.auditLogPath, f.state.Offset, maxShipBatch, maxShipBytes)
 		if err != nil {
 			return fmt.Errorf("reading audit log: %w", err)
 		}
@@ -231,7 +245,7 @@ func (f *forwarder) shipNewEvents() error {
 		if err := saveState(f.statePath, f.state); err != nil {
 			return err
 		}
-		if len(events) < maxShipBatch {
+		if !hasMore {
 			return nil
 		}
 	}
@@ -240,35 +254,55 @@ func (f *forwarder) shipNewEvents() error {
 // maxShipBatch is the most audit events shipped in one POST /v1/events.
 const maxShipBatch = 500
 
+// maxShipBytes is the most raw JSONL bytes read.go's shipNewEvents will
+// include in one batch, regardless of maxShipBatch — a structural bound
+// on the same margin dashboard/server/controlapi.go's maxIngestBytes
+// comment describes (500 events x daemon.DefaultOutputPreviewBytes stays
+// well under this today), rather than one that's only true by luck at
+// today's fixed preview size. Half of maxIngestBytes, leaving room for
+// the batch envelope's JSON overhead.
+const maxShipBytes = 8 << 20
+
 // readNewEvents reads audit.go's JSONL format starting at byte offset,
 // returning only complete lines (a partial trailing line — the daemon
-// mid-write — is left for the next read), at most maxEvents of them, and
-// the new offset to persist. Outcome patch lines (kind = "outcome") are
-// shipped as-is; the Control API merges them into the decision they name.
-func readNewEvents(path string, offset int64, maxEvents int) ([]store.IngestedEvent, int64, error) {
+// mid-write — is left for the next read), at most maxEvents of them (<=0
+// for unbounded) and at most maxBytes of raw line data (<=0 for
+// unbounded; always consumes at least one line regardless, so a single
+// oversized line can't stall forever), the new offset to persist, and
+// whether at least one more complete line remains unread (so the caller
+// knows to loop again even when a cap — not the log being drained — is
+// why fewer than maxEvents came back). Outcome patch lines (kind =
+// "outcome") are shipped as-is; the Control API merges them into the
+// decision they name.
+func readNewEvents(path string, offset int64, maxEvents int, maxBytes int64) (events []store.IngestedEvent, newOffset int64, hasMore bool, err error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, offset, nil // daemon hasn't logged anything yet
+			return nil, offset, false, nil // daemon hasn't logged anything yet
 		}
-		return nil, offset, err
+		return nil, offset, false, err
 	}
 	defer file.Close()
 
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return nil, offset, err
+		return nil, offset, false, err
 	}
 	data, err := io.ReadAll(file)
 	if err != nil {
-		return nil, offset, err
+		return nil, offset, false, err
 	}
 
-	var events []store.IngestedEvent
 	consumed := int64(0)
-	for maxEvents <= 0 || len(events) < maxEvents {
+	for {
+		if maxEvents > 0 && len(events) >= maxEvents {
+			return events, offset + consumed, moreCompleteLines(data[consumed:]), nil
+		}
 		idx := bytes.IndexByte(data[consumed:], '\n')
 		if idx == -1 {
-			break // partial line; wait for it to be completed next tick
+			return events, offset + consumed, false, nil // partial line; wait for it to be completed next tick
+		}
+		if len(events) > 0 && maxBytes > 0 && consumed+int64(idx) > maxBytes {
+			return events, offset + consumed, true, nil // byte budget hit; at least this one more complete line remains
 		}
 		line := data[consumed : consumed+int64(idx)]
 		consumed += int64(idx) + 1
@@ -314,5 +348,11 @@ func readNewEvents(path string, offset int64, maxEvents int) ([]store.IngestedEv
 		}
 		events = append(events, ie)
 	}
-	return events, offset + consumed, nil
+}
+
+// moreCompleteLines reports whether data contains at least one more
+// complete (newline-terminated) line — used to tell "stopped because a
+// cap was hit" apart from "stopped because the log is drained".
+func moreCompleteLines(data []byte) bool {
+	return bytes.IndexByte(data, '\n') != -1
 }

@@ -72,13 +72,24 @@ export interface RecordingHandler extends Handler {
  * `.reports` (and every evaluate on `.evaluates`). Every evaluate answer
  * carries an `event_id` the way the real daemon's does; `rejectReports`
  * makes `report` answer `{ok: false}` to test that a failed report never
- * affects the tool call. Mirrors sdk-python/tests/conftest.py. */
-export function decisionHandler(decisions: Record<string, Record<string, unknown>>, rejectReports = false): RecordingHandler {
+ * affects the tool call. `policyHash`/`policyPath`, when set, are echoed
+ * on `ping` the way the real daemon's Response.PolicyHash/PolicyPath are,
+ * for testing Guard's stale-policy check. Mirrors
+ * sdk-python/tests/conftest.py. */
+export function decisionHandler(
+  decisions: Record<string, Record<string, unknown>>,
+  rejectReports = false,
+  policyHash = "",
+  policyPath = "",
+): RecordingHandler {
   const reports: Record<string, unknown>[] = [];
   const evaluates: Record<string, unknown>[] = [];
   const handler = ((req) => {
     if (req.cmd === "ping") {
-      return { ok: true };
+      const resp: Record<string, unknown> = { ok: true };
+      if (policyHash) resp.policy_hash = policyHash;
+      if (policyPath) resp.policy_path = policyPath;
+      return resp;
     }
     if (req.cmd === "evaluate") {
       evaluates.push(req);

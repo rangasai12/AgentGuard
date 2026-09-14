@@ -9,7 +9,7 @@ import (
 	"os"
 	"testing"
 
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 // testServer opens the real local Postgres test database (same one

@@ -6,7 +6,7 @@ import (
 	"context"
 	"io"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // CompileProfile always fails on this platform: hardened mode has no

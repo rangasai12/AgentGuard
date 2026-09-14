@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // CompileProfile translates policy's filesystem write rules and network

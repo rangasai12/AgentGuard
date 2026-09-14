@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // These run only when actually compiled for a non-darwin GOOS. In this

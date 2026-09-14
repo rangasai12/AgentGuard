@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 // httpClient is a minimal client for agentguard-cloud's Control API

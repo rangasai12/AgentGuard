@@ -4,7 +4,9 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
 
-import { DaemonClient, DaemonUnavailable } from "../src/client.ts";
+import * as fs from "node:fs";
+
+import { DaemonClient, DaemonUnavailable, defaultSocketPath, policyContentHash } from "../src/client.ts";
 import { FakeDaemon, decisionHandler } from "./fakeDaemon.ts";
 
 function nowhereSocket(): string {
@@ -53,4 +55,46 @@ test("call surfaces an {ok: false} response as a plain object, not a throw", asy
   } finally {
     daemon.stop();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Policy-scoped default socket path (Fix 1: two agents on one machine with
+// two different policies must land on two different sockets automatically).
+// ---------------------------------------------------------------------------
+
+test("defaultSocketPath varies by policy", () => {
+  delete process.env.AGENTGUARD_SOCKET;
+  const a = defaultSocketPath("policy-a.yaml");
+  const b = defaultSocketPath("policy-b.yaml");
+  assert.notEqual(a, b);
+});
+
+test("defaultSocketPath is stable for the same policy", () => {
+  delete process.env.AGENTGUARD_SOCKET;
+  assert.equal(defaultSocketPath("policy.yaml"), defaultSocketPath("policy.yaml"));
+});
+
+test("defaultSocketPath env override wins", () => {
+  process.env.AGENTGUARD_SOCKET = "/tmp/explicit.sock";
+  try {
+    assert.equal(defaultSocketPath("policy.yaml"), "/tmp/explicit.sock");
+  } finally {
+    delete process.env.AGENTGUARD_SOCKET;
+  }
+});
+
+test("policyContentHash matches the Go algorithm (sha256 of raw bytes, first 12 hex chars)", () => {
+  const f = path.join(os.tmpdir(), `ag-policy-${crypto.randomBytes(4).toString("hex")}.yaml`);
+  const data = "version: 1\nname: x\n";
+  fs.writeFileSync(f, data);
+  try {
+    const expected = crypto.createHash("sha256").update(data).digest("hex").slice(0, 12);
+    assert.equal(policyContentHash(f), expected);
+  } finally {
+    fs.rmSync(f);
+  }
+});
+
+test("policyContentHash is undefined when the file cannot be read", () => {
+  assert.equal(policyContentHash(path.join(os.tmpdir(), "does-not-exist.yaml")), undefined);
 });

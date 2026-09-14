@@ -85,7 +85,7 @@ def fake_daemon():
         d.stop()
 
 
-def decision_handler(decisions: Dict[str, dict], reject_reports: bool = False):
+def decision_handler(decisions: Dict[str, dict], reject_reports: bool = False, policy_hash: str = "", policy_path: str = ""):
     """Builds a handler that answers `evaluate` requests by looking up the
     action's tool name in `decisions` (defaulting to deny for anything
     unlisted, matching the real engine's default-deny posture), answers
@@ -94,14 +94,21 @@ def decision_handler(decisions: Dict[str, dict], reject_reports: bool = False):
     so tests can assert on what the SDK sent. Every evaluate answer carries
     an `event_id` the way the real daemon's does; `reject_reports` makes
     `report` answer `{"ok": False}` to test that a failed report never
-    affects the tool call.
+    affects the tool call. `policy_hash`/`policy_path`, when set, are
+    echoed on `ping` the way the real daemon's Response.PolicyHash/
+    PolicyPath are, for testing Guard._ensure_daemon's stale-policy check.
     """
     reports: List[dict] = []
     evaluates: List[dict] = []
 
     def handle(req: dict) -> dict:
         if req.get("cmd") == "ping":
-            return {"ok": True}
+            resp = {"ok": True}
+            if policy_hash:
+                resp["policy_hash"] = policy_hash
+            if policy_path:
+                resp["policy_path"] = policy_path
+            return resp
         if req.get("cmd") == "evaluate":
             evaluates.append(req)
             tool = req.get("action", {}).get("tool")

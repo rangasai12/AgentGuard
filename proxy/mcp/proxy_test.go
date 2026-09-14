@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/approval"
-	"agentguard/daemon"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/approval"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 const proxyTestPolicy = `

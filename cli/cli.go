@@ -38,6 +38,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return runProxy(rest, stdout, stderr)
 	case "run":
 		return runRunCmd(rest, stdout, stderr)
+	case "cloud":
+		return runCloud(rest, stdout, stderr)
 	case "-h", "--help", "help":
 		printUsage(stdout)
 		return 0
@@ -66,5 +68,7 @@ Usage:
   agentctl proxy start [--policy policy.yaml] [--addr 127.0.0.1:8080] [--ca-cert path] [--ca-key path]
   agentctl proxy ca [--export path]
   agentctl run --policy policy.yaml [--proxy-addr 127.0.0.1:8080] -- <command> [args...]
+  agentctl cloud signup --company NAME --email EMAIL --password PASS [--api-url URL]
+  agentctl cloud agents create [--register] [--tenant id] <name>
 `)
 }

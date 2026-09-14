@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 // setupAnomalyAgent signs up a tenant and registers one agent through the

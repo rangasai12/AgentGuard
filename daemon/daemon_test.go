@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 const daemonTestPolicy = `

@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"agentguard/daemon"
+	"github.com/rangasai12/AgentGuard/daemon"
 )
 
 // maxResponseBytes bounds one line read back from the daemon.

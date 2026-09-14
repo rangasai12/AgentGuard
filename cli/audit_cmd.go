@@ -6,8 +6,8 @@ import (
 	"io"
 	"time"
 
-	"agentguard/daemon"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 func runAudit(args []string, stdout, stderr io.Writer) int {
@@ -19,7 +19,7 @@ func runAudit(args []string, stdout, stderr io.Writer) int {
 
 	fs := flag.NewFlagSet("audit "+sub, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	socketPath := fs.String("socket", DefaultSocketPath(), "unix socket path")
+	socketPath := fs.String("socket", DefaultSocketPath("policy.yaml"), "unix socket path (default: derived from ./policy.yaml, matching `daemon start`'s default)")
 	n := fs.Int("n", 20, "number of events to show (tail)")
 	filter := addAuditFilterFlags(fs, "(query)")
 

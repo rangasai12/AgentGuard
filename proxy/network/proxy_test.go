@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/daemon"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 const proxyTestPolicy = `

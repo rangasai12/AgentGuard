@@ -1,0 +1,57 @@
+name: publish-cli
+
+# Manual only — see publish-python.yml's note and RELEASING.md. Builds
+# agentctl for a few common platforms and attaches them to a GitHub
+# Release for the ref this was run against (normally a version tag,
+# vX.Y.Z) — uses the built-in GITHUB_TOKEN, no extra secret needed.
+# `go install github.com/rangasai12/AgentGuard/cli/cmd/agentctl@vX.Y.Z`
+# (see README.md) doesn't need this workflow at all; these are the
+# binaries for anyone who'd rather download one directly.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -o dist/agentctl-${{ matrix.goos }}-${{ matrix.goarch }} ./cli/cmd/agentctl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentctl-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/agentctl-${{ matrix.goos }}-${{ matrix.goarch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

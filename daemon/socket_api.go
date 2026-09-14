@@ -8,8 +8,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // Request is one line-delimited JSON message a client (SDK, CLI, proxy) sends
@@ -40,14 +41,43 @@ type Response struct {
 	EventID    string            `json:"event_id,omitempty"` // for evaluate: pass back to report
 	Events     []AuditEvent      `json:"events,omitempty"`
 	Pending    []PendingApproval `json:"pending,omitempty"`
+
+	// PolicyHash and PolicyPath identify the policy this daemon is running,
+	// returned on every "ping" response so a client can tell whether it has
+	// connected to the daemon it expects: cli.DefaultSocketPath's
+	// policy-scoped default keeps two *different* policies from ever
+	// landing on the same socket, but the *same* policy file edited on disk
+	// after its daemon started still needs a content check — see
+	// Guard._ensure_daemon (sdk-python/agentguard/guard.py,
+	// sdk-ts/src/guard.ts), which compares PolicyHash against the file's
+	// current contents before trusting a daemon that answers here.
+	PolicyHash string `json:"policy_hash,omitempty"`
+	PolicyPath string `json:"policy_path,omitempty"`
 }
 
+// maxLineBytes bounds one line of the daemon's own socket protocol.
+// proxy/mcp/proxy.go defines an unrelated constant of the same name at
+// 4 MiB, for the MCP stdio transport's JSON-RPC messages — deliberately
+// different values for two different transports with different payload
+// shapes, not drift; each package's copy is the only one that matters to
+// it, so this stays a plain const, not a shared one.
 const maxLineBytes = 1 << 20 // 1 MiB, generous for the small JSON payloads this protocol carries
 
-// Serve listens on socketPath (a Unix domain socket, removing any stale file
-// left over from a previous run) and handles requests against d until ctx is
-// canceled. Each accepted connection may carry multiple sequential requests.
-func Serve(ctx context.Context, socketPath string, d *Daemon) error {
+// Serve listens on socketPath (a Unix domain socket) and handles requests
+// against d until ctx is canceled. Each accepted connection may carry
+// multiple sequential requests.
+//
+// Unless force is true, Serve first checks whether something is already
+// listening and answering the daemon protocol at socketPath and, if so,
+// refuses to start rather than silently unlinking that daemon's socket out
+// from under it — this used to orphan a running daemon on every restart at
+// the (formerly machine-wide, now policy-scoped) default path.
+func Serve(ctx context.Context, socketPath string, d *Daemon, force bool) error {
+	if !force {
+		if err := checkNoLiveDaemon(socketPath); err != nil {
+			return err
+		}
+	}
 	if err := os.RemoveAll(socketPath); err != nil {
 		return fmt.Errorf("removing stale socket %s: %w", socketPath, err)
 	}
@@ -73,6 +103,33 @@ func Serve(ctx context.Context, socketPath string, d *Daemon) error {
 	}
 }
 
+// checkNoLiveDaemon returns an error if a daemon is already listening and
+// answering pings at socketPath. Any failure to dial or speak the protocol
+// (nothing listening, a stale socket file, an unrelated process on this
+// path) is treated as "safe to proceed" — this is a narrow guard against
+// clobbering a live daemon, not a general liveness prober.
+func checkNoLiveDaemon(socketPath string) error {
+	conn, err := net.DialTimeout("unix", socketPath, 200*time.Millisecond)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+
+	_ = conn.SetDeadline(time.Now().Add(200 * time.Millisecond))
+	if err := json.NewEncoder(conn).Encode(Request{Cmd: "ping"}); err != nil {
+		return nil
+	}
+	var resp Response
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil || !resp.OK {
+		return nil
+	}
+	policyPath := resp.PolicyPath
+	if policyPath == "" {
+		policyPath = "(unknown)"
+	}
+	return fmt.Errorf("a daemon is already running at %s (policy: %s) — stop it first, or pass --force to take over this socket", socketPath, policyPath)
+}
+
 func handleConn(conn net.Conn, d *Daemon) {
 	defer conn.Close()
 
@@ -96,7 +153,11 @@ func handleConn(conn net.Conn, d *Daemon) {
 func dispatch(d *Daemon, req Request) Response {
 	switch req.Cmd {
 	case "ping":
-		return Response{OK: true}
+		hash := ""
+		if p := d.Policy(); p != nil {
+			hash = p.Hash
+		}
+		return Response{OK: true, PolicyHash: hash, PolicyPath: d.PolicyPath}
 
 	case "evaluate":
 		result := d.Evaluate(DecisionRequest{Actor: req.Actor, RunID: req.RunID, AgentVersion: req.AgentVersion, Action: req.Action})

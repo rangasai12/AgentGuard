@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // Outcome is what an enforcement point learns after a tool actually ran:
@@ -48,16 +48,14 @@ const (
 	KindOutcome = "outcome"
 
 	// DefaultOutputPreviewBytes is how much of a tool's output the audit
-	// log keeps by default.
+	// log keeps — fixed, not configurable (see CHANGELOG "Fix 5": a
+	// configurable ceiling here was dead code with no caller, and made
+	// the forwarder's per-request byte budget a guess rather than a fact;
+	// well under the daemon socket's 1 MiB line limit either way).
 	DefaultOutputPreviewBytes = 4096
 	// MaxDescriptionBytes bounds Action.Description on a logged event; an
 	// enforcement point that sends more is truncated inside Decide.
 	MaxDescriptionBytes = 512
-
-	// MaxOutputPreviewBytes is the hard ceiling on a stored output preview,
-	// regardless of configuration — well under the socket's 1 MiB line
-	// limit.
-	MaxOutputPreviewBytes = 64 << 10
 )
 
 // AuditEvent is one recorded policy decision, written as one line of JSON to the
@@ -103,12 +101,11 @@ type AuditFilter struct {
 // AuditLogger appends events to a JSONL file and keeps a bounded recent-events
 // ring buffer in memory. Safe for concurrent use.
 type AuditLogger struct {
-	mu                 sync.Mutex
-	file               *os.File
-	writer             *bufio.Writer
-	recent             []AuditEvent
-	maxRecent          int
-	outputPreviewBytes int
+	mu        sync.Mutex
+	file      *os.File
+	writer    *bufio.Writer
+	recent    []AuditEvent
+	maxRecent int
 }
 
 const defaultMaxRecent = 2000
@@ -119,21 +116,7 @@ func NewAuditLogger(path string) (*AuditLogger, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening audit log %s: %w", path, err)
 	}
-	return &AuditLogger{file: f, writer: bufio.NewWriter(f), maxRecent: defaultMaxRecent, outputPreviewBytes: DefaultOutputPreviewBytes}, nil
-}
-
-// SetOutputPreviewBytes changes how much of a reported output is stored,
-// clamped to [0, MaxOutputPreviewBytes].
-func (l *AuditLogger) SetOutputPreviewBytes(n int) {
-	if n < 0 {
-		n = 0
-	}
-	if n > MaxOutputPreviewBytes {
-		n = MaxOutputPreviewBytes
-	}
-	l.mu.Lock()
-	l.outputPreviewBytes = n
-	l.mu.Unlock()
+	return &AuditLogger{file: f, writer: bufio.NewWriter(f), maxRecent: defaultMaxRecent}, nil
 }
 
 // Log appends ev to the audit log and the in-memory ring.
@@ -158,7 +141,7 @@ func (l *AuditLogger) Log(ev AuditEvent) error {
 // e.g. the daemon restarted between evaluate and report — since downstream
 // stores can still merge it.
 //
-// Output is truncated to the configured preview size; when the caller left
+// Output is truncated to DefaultOutputPreviewBytes; when the caller left
 // OutputBytes zero (meaning Output is the whole output), OutputBytes and
 // OutputSHA256 are filled from the untruncated value first.
 func (l *AuditLogger) Report(eventID string, o Outcome) error {
@@ -181,7 +164,7 @@ func (l *AuditLogger) Report(eventID string, o Outcome) error {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	o.Output = truncateUTF8(o.Output, l.outputPreviewBytes)
+	o.Output = truncateUTF8(o.Output, DefaultOutputPreviewBytes)
 
 	for i := len(l.recent) - 1; i >= 0; i-- {
 		if l.recent[i].EventID == eventID && l.recent[i].Kind == "" {

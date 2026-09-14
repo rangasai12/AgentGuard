@@ -5,7 +5,7 @@ package main
 import (
 	"os"
 
-	"agentguard/cli"
+	"github.com/rangasai12/AgentGuard/cli"
 )
 
 func main() {

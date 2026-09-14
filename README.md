@@ -119,8 +119,16 @@ than just recording it afterward.
 
 ### 1. Build the CLI
 
+From a checkout of this repo:
+
 ```bash
 go build -o bin/agentctl ./cli/cmd/agentctl
+```
+
+Or, once a release is tagged, without cloning anything:
+
+```bash
+go install github.com/rangasai12/AgentGuard/cli/cmd/agentctl@latest
 ```
 
 ### 2. Write a policy and start the daemon
@@ -188,6 +196,12 @@ detection run automatically as events arrive, no setup required. The cloud is
 strictly additive: local capture and enforcement keep working even if it's
 unreachable.
 
+Prefer the terminal to the browser? `agentctl cloud signup` +
+`agentctl cloud agents create --register` do the same sign-up/add-agent/
+register flow above without a UI — see
+[`docs/api-reference.md`](docs/api-reference.md) for the exact REST contract
+either path drives.
+
 ## Contributing
 
 Read `docs/conventions.md` before adding code. It records the one rule this repo
@@ -214,3 +228,7 @@ classification, and rules-free anomaly detection with tenant-configurable
 thresholds are built and tested. Run grouping, real-time cloud alerting,
 additional framework adapters, and a compliance export are not yet built; see
 `CHANGELOG.md` for the full build log and design rationale behind every piece.
+
+Pre-1.0 (`0.x`): breaking changes are possible between minor versions until
+a `1.0.0` release — see `RELEASING.md` for the versioning policy and how a
+release is cut.

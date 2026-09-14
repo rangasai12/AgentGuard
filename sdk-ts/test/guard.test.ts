@@ -7,8 +7,8 @@ import { createHash } from "node:crypto";
 
 import * as fs from "node:fs";
 import { Guard, DaemonStartError, gitHeadVersion } from "../src/guard.ts";
-import { PolicyDenied } from "../src/exceptions.ts";
-import { DaemonClient } from "../src/client.ts";
+import { DaemonPolicyMismatchError, PolicyDenied } from "../src/exceptions.ts";
+import { DaemonClient, policyContentHash } from "../src/client.ts";
 import { FakeDaemon, decisionHandler } from "./fakeDaemon.ts";
 
 async function makeGuard(decisions: Record<string, Record<string, unknown>>): Promise<{ guard: Guard; daemon: FakeDaemon }> {
@@ -201,6 +201,62 @@ test("Guard.create throws DaemonStartError when agentctl is missing and nothing 
   );
 });
 
+test("Guard.create rejects a daemon whose policy_hash does not match our policy file", async () => {
+  const policyFile = path.join(os.tmpdir(), `ag-policy-${crypto.randomBytes(4).toString("hex")}.yaml`);
+  fs.writeFileSync(policyFile, "version: 1\n");
+  const staleHash = "0".repeat(12);
+  assert.notEqual(policyContentHash(policyFile), staleHash);
+  const daemon = await FakeDaemon.start(decisionHandler({}, false, staleHash, policyFile));
+  try {
+    await assert.rejects(
+      () =>
+        Guard.create(policyFile, {
+          socketPath: daemon.socketPath,
+          autoStart: true,
+          agentctlPath: "definitely-not-a-real-binary-xyz",
+        }),
+      DaemonPolicyMismatchError,
+    );
+  } finally {
+    daemon.stop();
+    fs.rmSync(policyFile);
+  }
+});
+
+test("Guard.create accepts a daemon whose policy_hash matches our policy file", async () => {
+  const policyFile = path.join(os.tmpdir(), `ag-policy-${crypto.randomBytes(4).toString("hex")}.yaml`);
+  fs.writeFileSync(policyFile, "version: 1\n");
+  const correctHash = policyContentHash(policyFile);
+  const daemon = await FakeDaemon.start(decisionHandler({}, false, correctHash));
+  try {
+    const guard = await Guard.create(policyFile, {
+      socketPath: daemon.socketPath,
+      autoStart: true,
+      agentctlPath: "definitely-not-a-real-binary-xyz",
+    });
+    const decision = await guard.check("anything");
+    assert.equal(decision.result, "deny");
+  } finally {
+    daemon.stop();
+    fs.rmSync(policyFile);
+  }
+});
+
+test("Guard.create skips the policy check when the daemon predates policy_hash", async () => {
+  const daemon = await FakeDaemon.start(decisionHandler({}));
+  try {
+    const guard = await Guard.create("unused.yaml", {
+      socketPath: daemon.socketPath,
+      autoStart: true,
+      agentctlPath: "definitely-not-a-real-binary-xyz",
+    });
+    const decision = await guard.check("anything");
+    assert.equal(decision.result, "deny");
+  } finally {
+    daemon.stop();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Outcome reporting and run/version identity (mirrors the Python tests)
 // ---------------------------------------------------------------------------
@@ -270,6 +326,16 @@ test("output is truncated on a UTF-8 boundary and hashed in full", async () => {
     assert.equal(outcome.output_bytes, 200);
     assert.equal(outcome.output, "é".repeat(5));
     assert.equal(outcome.output_sha256, createHash("sha256").update(big, "utf8").digest("hex"));
+  } finally {
+    daemon.stop();
+  }
+});
+
+test("maxOutputBytes is clamped to a hard ceiling", async () => {
+  // Mirrors the Python SDK's test_max_output_bytes_is_clamped_to_a_hard_ceiling.
+  const { guard, daemon } = await makeRecordingGuard({}, { maxOutputBytes: 10_000_000 });
+  try {
+    assert.equal(guard.maxOutputBytes, 64 * 1024);
   } finally {
     daemon.stop();
   }
@@ -345,6 +411,21 @@ test("run id and agent version are sent on every evaluate and exported to the en
     else process.env.AGENTGUARD_RUN_ID = savedRun;
     if (savedVer === undefined) delete process.env.AGENTGUARD_AGENT_VERSION;
     else process.env.AGENTGUARD_AGENT_VERSION = savedVer;
+  }
+});
+
+test("run id fallback format matches the Python SDK's shape", async () => {
+  // randomBytes(8).toString("hex"): 16 lowercase hex chars — mirrors
+  // sdk-python's test_run_id_fallback_format (see CHANGELOG "Fix 5").
+  const saved = process.env.AGENTGUARD_RUN_ID;
+  delete process.env.AGENTGUARD_RUN_ID;
+  const { guard, daemon } = await makeRecordingGuard({});
+  try {
+    assert.match(guard.runId, /^[0-9a-f]{16}$/);
+  } finally {
+    daemon.stop();
+    if (saved === undefined) delete process.env.AGENTGUARD_RUN_ID;
+    else process.env.AGENTGUARD_RUN_ID = saved;
   }
 });
 

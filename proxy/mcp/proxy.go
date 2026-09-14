@@ -22,13 +22,18 @@ import (
 	"sync"
 	"time"
 
-	"agentguard/approval"
-	"agentguard/daemon"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/approval"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // maxLineBytes bounds a single MCP JSON-RPC message. The MCP stdio transport
 // requires one message per line with no embedded newlines.
+//
+// daemon/socket_api.go defines an unrelated constant of the same name at
+// 1 MiB, for the daemon's own socket protocol — deliberately different
+// values for two different transports with different payload shapes
+// (a raw tool result here vs. small decision JSON there), not drift.
 const maxLineBytes = 4 << 20 // 4 MiB, generous for tool call payloads
 
 type rpcMessage struct {

@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"agentguard/daemon"
-	"agentguard/engine"
-	mcpproxy "agentguard/proxy/mcp"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
+	mcpproxy "github.com/rangasai12/AgentGuard/proxy/mcp"
 )
 
 func runMCPProxy(args []string, stdout, stderr io.Writer) int {
@@ -20,12 +20,15 @@ func runMCPProxy(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	policyPath := fs.String("policy", "policy.yaml", "path to the policy file")
 	serverName := fs.String("server", "", "logical MCP server name for policy matching (defaults to the command's base name)")
-	auditPath := fs.String("audit", DefaultAuditLogPath(), "path to the JSONL audit log")
+	auditPath := fs.String("audit", "", "path to the JSONL audit log (default: derived from --policy)")
 	actor := fs.String("actor", "", "actor name recorded in audit events")
 	runID := fs.String("run-id", os.Getenv("AGENTGUARD_RUN_ID"), "run id recorded in audit events (default $AGENTGUARD_RUN_ID, as set by an SDK-wrapped parent process)")
 	agentVersion := fs.String("agent-version", os.Getenv("AGENTGUARD_AGENT_VERSION"), "agent version recorded in audit events (default $AGENTGUARD_AGENT_VERSION)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *auditPath == "" {
+		*auditPath = DefaultAuditLogPath(*policyPath)
 	}
 	rest := fs.Args()
 	if len(rest) == 0 {

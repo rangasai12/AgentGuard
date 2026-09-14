@@ -8,7 +8,7 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 func newTestAuditLogger(t *testing.T) *AuditLogger {
@@ -154,7 +154,7 @@ func TestAuditReportTruncatesOversizedOutput(t *testing.T) {
 	if err := l.Log(AuditEvent{EventID: id, Decision: engine.Allow}); err != nil {
 		t.Fatalf("Log: %v", err)
 	}
-	big := strings.Repeat("é", MaxOutputPreviewBytes) // 2 bytes each: twice the hard cap
+	big := strings.Repeat("é", DefaultOutputPreviewBytes) // 2 bytes each: twice the preview size
 	if err := l.Report(id, Outcome{Status: OutcomeSuccess, Output: big}); err != nil {
 		t.Fatalf("Report: %v", err)
 	}
@@ -167,15 +167,6 @@ func TestAuditReportTruncatesOversizedOutput(t *testing.T) {
 	}
 	if got.OutputBytes != int64(len(big)) {
 		t.Errorf("output_bytes must describe the full output (%d), got %d", len(big), got.OutputBytes)
-	}
-
-	// Configured preview above the hard cap is clamped to it.
-	l.SetOutputPreviewBytes(10 * MaxOutputPreviewBytes)
-	if err := l.Report(id, Outcome{Status: OutcomeSuccess, Output: big}); err != nil {
-		t.Fatalf("Report: %v", err)
-	}
-	if got := l.Tail(1)[0].Outcome; len(got.Output) > MaxOutputPreviewBytes {
-		t.Errorf("expected the hard cap %d to bind, got %d bytes", MaxOutputPreviewBytes, len(got.Output))
 	}
 
 	// Malformed ids and statuses are rejected before anything is written.

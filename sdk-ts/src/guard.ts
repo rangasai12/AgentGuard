@@ -11,16 +11,25 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DaemonClient, defaultSocketPath, type Decision } from "./client.ts";
-import { PolicyDenied } from "./exceptions.ts";
+import { DaemonClient, defaultSocketPath, policyContentHash, type Decision } from "./client.ts";
+import { DaemonPolicyMismatchError, PolicyDenied } from "./exceptions.ts";
 
 /** Longest string argument value forwarded to the daemon, per argument —
- * see MAX_ARG_BYTES in the Python SDK for why. */
+ * see MAX_ARG_BYTES in the Python SDK for why. Hand-duplicated identically
+ * there since a Go binary and this package have no build-time link to
+ * share a constant across (see docs/conventions.md's cross-language
+ * constants row) — a future change to this value is a prompt to update
+ * its Python mirror too, not a silent drift. */
 const MAX_ARG_BYTES = 16 * 1024;
 const MAX_ERROR_BYTES = 4 * 1024;
 /** Longest tool description attached to a tool's first evaluate (the
  * daemon caps at the same size). */
 const MAX_DESCRIPTION_BYTES = 512;
+/** Hard ceiling on maxOutputBytes (GuardOptions), regardless of what's
+ * configured — see MAX_OUTPUT_BYTES_CEILING in the Python SDK for why
+ * (an unbounded value can build a `report` line that exceeds the daemon
+ * socket's 1 MiB line limit, which then silently stops the connection). */
+const MAX_OUTPUT_BYTES_CEILING = 64 * 1024;
 
 export class DaemonStartError extends Error {
   constructor(message: string) {
@@ -105,7 +114,7 @@ export class Guard {
     this.policyPath = policyPath;
     this.actor = opts.actor ?? "typescript-sdk";
     this.namespace = opts.namespace ?? "local-tools";
-    this.socketPath = opts.socketPath ?? defaultSocketPath();
+    this.socketPath = opts.socketPath ?? defaultSocketPath(policyPath);
     this.client = opts.client ?? new DaemonClient(this.socketPath);
 
     this.agentVersion = opts.agentVersion || process.env.AGENTGUARD_AGENT_VERSION || undefined;
@@ -121,7 +130,7 @@ export class Guard {
     const envCapture = process.env.AGENTGUARD_CAPTURE_OUTPUT;
     this.captureOutput =
       opts.captureOutput ?? !(envCapture !== undefined && ["0", "false", "no"].includes(envCapture.toLowerCase()));
-    this.maxOutputBytes = Math.max(0, opts.maxOutputBytes ?? 4096);
+    this.maxOutputBytes = Math.min(Math.max(0, opts.maxOutputBytes ?? 4096), MAX_OUTPUT_BYTES_CEILING);
   }
 
   /**
@@ -139,7 +148,7 @@ export class Guard {
   }
 
   private async ensureDaemon(agentctlPath: string, timeoutMs: number): Promise<void> {
-    if (await this.client.ping()) return;
+    if (await this.pingAndCheckPolicy()) return;
 
     // Unlike Python's subprocess.Popen (which raises synchronously on
     // ENOENT), Node's spawn() returns immediately and only reports a
@@ -166,13 +175,50 @@ export class Guard {
     const pingUntilUp = (async () => {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        if (await this.client.ping()) return;
+        if (await this.pingAndCheckPolicy()) return;
         await sleep(50);
       }
       throw new DaemonStartError(`agentguard daemon did not come up within ${timeoutMs}ms at '${this.socketPath}'`);
     })();
 
     await Promise.race([spawnFailed, pingUntilUp]);
+  }
+
+  /**
+   * Ping the daemon at this.socketPath; if one answers, verify its
+   * reported policy_hash matches this Guard's own policy file, read fresh
+   * from disk (not cached from construction, so a policy edited and saved
+   * after the daemon started is actually caught).
+   *
+   * defaultSocketPath's policy-scoped default already keeps two
+   * *different* policy files from ever landing on the same socket by
+   * accident — this check is the narrower remaining case: the *same*
+   * policy file, edited since its daemon started, still answering at the
+   * (correctly-scoped) socket with stale rules. Throws
+   * DaemonPolicyMismatchError rather than silently trusting a stale
+   * daemon; an old daemon that predates this check (no policy_hash in its
+   * ping response) is treated as compatible, same as before this existed.
+   */
+  private async pingAndCheckPolicy(): Promise<boolean> {
+    let resp;
+    try {
+      resp = await this.client.call("ping");
+    } catch {
+      return false;
+    }
+    if (!resp.ok) return false;
+    const daemonHash = resp.policy_hash;
+    if (daemonHash) {
+      const ourHash = policyContentHash(this.policyPath);
+      if (ourHash && daemonHash !== ourHash) {
+        throw new DaemonPolicyMismatchError(
+          `the agentguard daemon at '${this.socketPath}' is running ${resp.policy_path || "a policy"} ` +
+            `(hash ${daemonHash}), which does not match '${this.policyPath}' on disk (hash ${ourHash}). ` +
+            `Restart the daemon so it picks up the current file: \`agentctl daemon start --policy ${this.policyPath}\`.`,
+        );
+      }
+    }
+    return true;
   }
 
   // --------------------------------------------------------------------

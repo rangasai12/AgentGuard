@@ -9,8 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"agentguard/engine"
-	"agentguard/hardened"
+	"github.com/rangasai12/AgentGuard/engine"
+	"github.com/rangasai12/AgentGuard/hardened"
 )
 
 // runRunCmd implements `agentctl run`: OS-level hardened mode, running an

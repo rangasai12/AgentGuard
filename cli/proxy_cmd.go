@@ -10,9 +10,9 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"agentguard/daemon"
-	"agentguard/engine"
-	networkproxy "agentguard/proxy/network"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
+	networkproxy "github.com/rangasai12/AgentGuard/proxy/network"
 )
 
 func runProxy(args []string, stdout, stderr io.Writer) int {
@@ -36,8 +36,8 @@ func runProxyStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("proxy start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	policyPath := fs.String("policy", "policy.yaml", "path to the policy file")
-	addr := fs.String("addr", "127.0.0.1:8080", "address to listen on")
-	auditPath := fs.String("audit", DefaultAuditLogPath(), "path to the JSONL audit log")
+	addr := fs.String("addr", DefaultProxyAddr(), "address to listen on (default $AGENTGUARD_PROXY_ADDR, else 127.0.0.1:8080)")
+	auditPath := fs.String("audit", "", "path to the JSONL audit log (default: derived from --policy)")
 	caCertPath := fs.String("ca-cert", DefaultCACertPath(), "path to the interception CA certificate (created if missing)")
 	caKeyPath := fs.String("ca-key", DefaultCAKeyPath(), "path to the interception CA private key (created if missing)")
 	actor := fs.String("actor", "", "actor name recorded in audit events")
@@ -45,6 +45,9 @@ func runProxyStart(args []string, stdout, stderr io.Writer) int {
 	agentVersion := fs.String("agent-version", os.Getenv("AGENTGUARD_AGENT_VERSION"), "agent version recorded in audit events (default $AGENTGUARD_AGENT_VERSION)")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *auditPath == "" {
+		*auditPath = DefaultAuditLogPath(*policyPath)
 	}
 
 	policy, err := engine.LoadPolicy(*policyPath)

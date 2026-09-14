@@ -6,6 +6,7 @@ runtime dependencies.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -13,17 +14,75 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-def default_socket_path() -> str:
-    """Mirrors cli.DefaultSocketPath on the Go side: AGENTGUARD_SOCKET env var,
-    else ~/.agentguard/agentguard.sock, else a temp-dir fallback.
+def default_socket_path(policy_path: Optional[str] = None) -> str:
+    """Mirrors cli.DefaultSocketPath on the Go side: AGENTGUARD_SOCKET env
+    var, else a path under ~/.agentguard (or a temp-dir fallback), scoped by
+    policy_path so two Guard()s pointed at two different policy files land
+    on two different sockets with nothing to configure.
+
+    policy_path is optional (default None, matching pre-scoping behavior)
+    only for backward compatibility with any existing direct caller of this
+    public helper; Guard always passes its own policy path.
+
+    Must stay byte-for-byte in sync with policyScope in cli/paths.go and
+    defaultSocketPath in sdk-ts/src/client.ts — see that Go function's
+    docstring for why (a plain `agentctl daemon start --policy foo.yaml`
+    and a plain `Guard(policy="foo.yaml")` must land on the same socket with
+    neither one told the other's path).
     """
     env = os.environ.get("AGENTGUARD_SOCKET")
     if env:
         return env
-    home = Path.home()
-    if home:
-        return str(home / ".agentguard" / "agentguard.sock")
-    return str(Path(os.environ.get("TMPDIR", "/tmp")) / "agentguard.sock")
+    return _default_path(policy_path, "agentguard.sock")
+
+
+def default_audit_log_path(policy_path: Optional[str] = None) -> str:
+    """Mirrors cli.DefaultAuditLogPath on the Go side. See
+    default_socket_path — the two are scoped identically. Guard itself never
+    needs this (it only ever dials a socket; a daemon it spawns computes its
+    own audit-log default from the --policy flag it's given), but it's
+    exposed for parity with the Go side's public surface.
+    """
+    env = os.environ.get("AGENTGUARD_AUDIT_LOG")
+    if env:
+        return env
+    return _default_path(policy_path, "audit.log")
+
+
+def _default_path(policy_path: Optional[str], name: str) -> str:
+    try:
+        home: Optional[Path] = Path.home()
+    except RuntimeError:
+        home = None
+    base = home if home is not None else Path(os.environ.get("TMPDIR", "/tmp"))
+    if not policy_path:
+        return str(base / ".agentguard" / name) if home is not None else str(base / name)
+    scope = _policy_scope(policy_path)
+    if home is not None:
+        return str(base / ".agentguard" / "daemons" / scope / name)
+    return str(base / "daemons" / scope / name)
+
+
+def _policy_scope(policy_path: str) -> str:
+    """First 12 hex chars of sha256(absolute policy path) — see
+    policyScope in cli/paths.go for why this must match exactly."""
+    abs_path = os.path.abspath(policy_path)
+    return hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:12]
+
+
+def policy_content_hash(policy_path: str) -> Optional[str]:
+    """First 12 hex chars of sha256(the policy file's raw bytes) — mirrors
+    engine.Policy.Hash on the Go side exactly (no YAML parsing/
+    normalization: whitespace and comments change this hash). None if the
+    file cannot be read, so a caller can skip a comparison it has no data
+    for rather than guessing.
+    """
+    try:
+        with open(policy_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()[:12]
 
 
 class DaemonUnavailable(RuntimeError):

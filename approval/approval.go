@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // Func is called for an action that requires approval. It returns

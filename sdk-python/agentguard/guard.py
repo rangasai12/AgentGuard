@@ -13,13 +13,13 @@ import hashlib
 import inspect
 import json
 import os
+import secrets
 import subprocess
 import time
-import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from .client import DaemonClient, DaemonUnavailable, default_socket_path
-from .exceptions import PolicyDenied
+from .client import DaemonClient, DaemonUnavailable, default_socket_path, policy_content_hash
+from .exceptions import DaemonPolicyMismatch, PolicyDenied
 
 # Longest string argument value forwarded to the daemon, per argument. The
 # audit trail wants the arguments, but a tool that takes a whole file's
@@ -27,6 +27,13 @@ from .exceptions import PolicyDenied
 # line limit is 1 MiB, and blowing it would *block* the tool). Policy
 # conditions on strings this long are not realistic, so the cap only ever
 # affects what is logged.
+#
+# MAX_ARG_BYTES, MAX_ERROR_BYTES, and MAX_DESCRIPTION_BYTES below are
+# hand-duplicated identically in sdk-ts/src/guard.ts (a Go binary and a
+# Python package have no build-time link to share a constant across) —
+# see docs/conventions.md's cross-language constants row. A future change
+# to one of these three is a prompt to update its TS mirror too, not a
+# silent drift.
 MAX_ARG_BYTES = 16 * 1024
 
 # Longest error message reported for a failed tool call.
@@ -35,6 +42,43 @@ MAX_ERROR_BYTES = 4 * 1024
 # Longest tool description attached to a tool's first evaluate (the daemon
 # caps at the same size).
 MAX_DESCRIPTION_BYTES = 512
+
+# Hard ceiling on max_output_bytes (below), regardless of what's passed to
+# Guard(). Without one, a large configured value can build a `report`
+# request line that exceeds the daemon socket's 1 MiB line limit
+# (daemon/socket_api.go's maxLineBytes), which then just silently stops
+# the connection with no error surfaced back to the caller. On the same
+# scale as MAX_ARG_BYTES/MAX_ERROR_BYTES above, well under the socket
+# limit.
+MAX_OUTPUT_BYTES_CEILING = 64 * 1024
+
+# The field(s) each action type needs to be evaluated at all — mirrors
+# engine.Action.Validate on the Go side field-for-field. Used by
+# _validate_action_fields to catch a @guard.checked(...) field_map that
+# forgot one of them (the exact bug behind the "no network rule matched"
+# complaint: an omitted `method` silently reached the daemon and fell
+# through to a generic deny) before it ever reaches the daemon — for
+# secret_env, whose policy default is *allow*, this is what stops an
+# omitted env_var from being a silent bypass rather than just a confusing
+# round trip.
+_REQUIRED_ACTION_FIELDS = {
+    "fs_read": ("path",),
+    "fs_write": ("path",),
+    "network": ("domain", "method"),
+    "shell": ("command",),
+    "mcp_tool": ("server", "tool"),
+    "function": ("name",),
+    "secret_env": ("env_var",),
+}
+
+
+def _validate_action_fields(action_type: str, action: Dict[str, Any]) -> None:
+    for field in _REQUIRED_ACTION_FIELDS.get(action_type, ()):
+        if not action.get(field):
+            raise ValueError(
+                f"guard.checked({action_type!r}, ...): {field!r} is required but was not "
+                f"set (add {field}=... to the field_map, or a callable that computes it)"
+            )
 
 
 class DaemonStartError(RuntimeError):
@@ -94,11 +138,18 @@ class Guard:
         self.policy_path = policy
         self.actor = actor
         self.namespace = namespace
-        self.socket_path = socket_path or default_socket_path()
+        self.socket_path = socket_path or default_socket_path(self.policy_path)
         self._client = client or DaemonClient(self.socket_path)
 
         self.agent_version = agent_version or os.environ.get("AGENTGUARD_AGENT_VERSION") or None
-        self.run_id = run_id or os.environ.get("AGENTGUARD_RUN_ID") or uuid.uuid4().hex[:16]
+        # secrets.token_hex(8): 16 lowercase hex chars from a CSPRNG, same
+        # shape as the TS SDK's randomBytes(8).toString("hex") fallback —
+        # uuid4().hex[:16] used to fix a version nibble at a known offset
+        # inside that slice, giving this "opaque random run id" concept
+        # slightly less entropy and a different shape than its TS mirror
+        # for no reason (see CHANGELOG "Fix 5"). A caller-supplied run_id
+        # is unaffected either way.
+        self.run_id = run_id or os.environ.get("AGENTGUARD_RUN_ID") or secrets.token_hex(8)
         os.environ["AGENTGUARD_RUN_ID"] = self.run_id
 
         # Tool metadata gathered at wrap time: descriptions (sent once per
@@ -119,13 +170,13 @@ class Guard:
         if capture_output is None:
             capture_output = os.environ.get("AGENTGUARD_CAPTURE_OUTPUT", "1").lower() not in ("0", "false", "no")
         self.capture_output = capture_output
-        self.max_output_bytes = max(0, max_output_bytes)
+        self.max_output_bytes = min(max(0, max_output_bytes), MAX_OUTPUT_BYTES_CEILING)
 
         if client is None and auto_start:
             self._ensure_daemon(agentctl_path, start_timeout)
 
     def _ensure_daemon(self, agentctl_path: str, timeout: float) -> None:
-        if self._client.ping():
+        if self._ping_and_check_policy():
             return
         try:
             subprocess.Popen(
@@ -144,12 +195,46 @@ class Guard:
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._client.ping():
+            if self._ping_and_check_policy():
                 return
             time.sleep(0.05)
         raise DaemonStartError(
             f"agentguard daemon did not come up within {timeout}s at {self.socket_path!r}"
         )
+
+    def _ping_and_check_policy(self) -> bool:
+        """Ping the daemon at self.socket_path; if one answers, verify its
+        reported policy_hash matches this Guard's own policy file, read
+        fresh from disk (not cached from construction, so a policy edited
+        and saved after the daemon started is actually caught).
+
+        cli.DefaultSocketPath's policy-scoped default already keeps two
+        *different* policy files from ever landing on the same socket by
+        accident — this check is the narrower remaining case: the *same*
+        policy file, edited since its daemon started, still answering at
+        the (correctly-scoped) socket with stale rules. Raises
+        DaemonPolicyMismatch rather than silently trusting a stale daemon;
+        an old daemon that predates this check (no policy_hash in its ping
+        response) is treated as compatible, same as before this existed.
+        """
+        try:
+            resp = self._client.call("ping")
+        except DaemonUnavailable:
+            return False
+        if not resp.get("ok"):
+            return False
+        daemon_hash = resp.get("policy_hash")
+        if daemon_hash:
+            our_hash = policy_content_hash(self.policy_path)
+            if our_hash and daemon_hash != our_hash:
+                raise DaemonPolicyMismatch(
+                    f"the agentguard daemon at {self.socket_path!r} is running "
+                    f"{resp.get('policy_path') or 'a policy'} (hash {daemon_hash}), "
+                    f"which does not match {self.policy_path!r} on disk (hash "
+                    f"{our_hash}). Restart the daemon so it picks up the current "
+                    f"file: `agentctl daemon start --policy {self.policy_path}`."
+                )
+        return True
 
     # ------------------------------------------------------------------
     # The one decision path and the one execution path. Every public
@@ -364,6 +449,7 @@ class Guard:
                 for field, source in field_map.items():
                     action[field] = source(call_args) if callable(source) else call_args[source]
                 action["args"] = _capture_args(dict(call_args))
+                _validate_action_fields(action_type, action)
                 return action
 
             return self._wrap_callable(action_type, fn, build_action)

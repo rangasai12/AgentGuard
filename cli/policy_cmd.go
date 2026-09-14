@@ -6,8 +6,8 @@ import (
 	"io"
 	"os"
 
-	"agentguard/daemon"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/daemon"
+	"github.com/rangasai12/AgentGuard/engine"
 
 	"gopkg.in/yaml.v3"
 )
@@ -110,7 +110,7 @@ func runPolicyTest(args []string, stdout, stderr io.Writer) int {
 func runPolicyRecord(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("policy record", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	socketPath := fs.String("socket", DefaultSocketPath(), "unix socket path")
+	socketPath := fs.String("socket", DefaultSocketPath("policy.yaml"), "unix socket path (default: derived from ./policy.yaml, matching `daemon start`'s default)")
 	output := fs.String("output", "", "write the trace file here (default: stdout)")
 	limit := fs.Int("n", 100, "maximum number of events to record (most recent first)")
 	filter := addAuditFilterFlags(fs, "")

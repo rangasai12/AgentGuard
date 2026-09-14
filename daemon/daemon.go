@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // Daemon evaluates actions against a policy, logging every decision and
@@ -26,6 +26,13 @@ type Daemon struct {
 	// alert a human via Slack/webhook rather than requiring them to poll
 	// `agentctl audit tail`/`pending_approvals`.
 	Notify Notifier
+
+	// PolicyPath is the file this daemon's policy was loaded from, if any
+	// — reported over ping (see socket_api.go's Response.PolicyPath) so a
+	// client can tell which policy a daemon it just connected to is
+	// running. Set once by the caller before Serve starts; never mutated
+	// afterward, so it's safe to read without the mutex above.
+	PolicyPath string
 }
 
 // New constructs a Daemon over an already-loaded policy and audit logger.

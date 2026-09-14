@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 // registerControlAPI mounts the agent-facing endpoints every
@@ -71,9 +71,13 @@ func handleRegisterAgent(s *store.Store) http.HandlerFunc {
 	}
 }
 
-// Ingest limits. Events now carry arguments and output previews (up to
-// 64 KiB each), so one batch is bounded in both count and bytes; the
-// forwarder ships at most 500 per request and loops, well within both.
+// Ingest limits. Events carry arguments and an output preview
+// (daemon.DefaultOutputPreviewBytes, 4 KiB, fixed) each, so a batch of
+// maxShipBatch (cmd/agentguard-forwarder/main.go, 500) events is at most
+// ~2 MiB — comfortably within maxIngestBytes. That margin holds only
+// because the preview size is fixed; if it's ever made configurable
+// again, this comment's math (and maxShipBatch's byte-awareness — see
+// readNewEvents) needs to move with it, not be re-derived from scratch.
 const (
 	maxIngestEvents = 5000
 	maxIngestBytes  = 16 << 20

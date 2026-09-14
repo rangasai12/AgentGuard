@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"agentguard/dashboard/server"
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/dashboard/server"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 func main() {

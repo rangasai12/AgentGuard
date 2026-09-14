@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // PendingApproval describes one action that is blocked awaiting a human decision.

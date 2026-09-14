@@ -79,6 +79,17 @@ second tenant-settings table or page, a second tool table, a second metrics/aggr
 | Anomalies table + API | `anomalies` table, `store.Anomaly` + `UpsertAnomaly`/`ListAnomalies`/`AckAnomaly`, `GET /api/anomalies` + `POST /api/anomalies/ack` |
 | Tenant anomaly-detection settings | `tenant_settings` table, `store.TenantSettings` + `DefaultTenantSettings`, `GET/PUT /api/settings`, `SettingsPage.tsx` |
 | Anomaly list UI | `components/AnomalyList.tsx` (used by `OverviewPage` and the Fleet `AgentDetailPanel` — never re-rendered inline in either) |
+| Policy-scoped default socket/audit-log path | `cli.DefaultSocketPath`/`DefaultAuditLogPath` (`cli/paths.go`), mirrored by `default_socket_path`/`default_audit_log_path` (`sdk-python/agentguard/client.py`) and `defaultSocketPath`/`defaultAuditLogPath` (`sdk-ts/src/client.ts`) — all three must hash a policy's absolute path identically (`policyScope`/`_policy_scope`) |
+| Daemon identity over ping (policy content hash, distinct from the path-hash above) | `Response.PolicyHash`/`PolicyPath` (`daemon/socket_api.go`), checked against `policy_content_hash`/`policyContentHash` (Python/TS `client.py`/`client.ts`) by `Guard._ensure_daemon`/`ensureDaemon` |
+| Refuse to clobber a live daemon | `daemon.checkNoLiveDaemon`, called from `Serve` unless `force` |
+| Network proxy listen address default | `cli.DefaultProxyAddr` (`cli/paths.go`) |
+| Runtime action validation (required fields per action type) | `Action.Validate` (`engine/types.go`), called first thing inside `Evaluate`; mirrored client-side (Python only) by `_validate_action_fields` + `_REQUIRED_ACTION_FIELDS` (`sdk-python/agentguard/guard.py`) |
+| Signup → create-agent → register CLI flow | `agentctl cloud signup` / `agentctl cloud agents create` (`cli/cloud_cmd.go`); the exact REST contract they drive is `docs/api-reference.md` |
+| Cloud API request/response contract (signup, create agent, register) | `docs/api-reference.md` |
+| Release/versioning process | `RELEASING.md` |
+| CI (test-on-push) | `.github/workflows/test.yml` |
+| Manual publish workflows | `.github/workflows/publish-python.yml`, `publish-npm.yml`, `publish-cli.yml` — one per package, `workflow_dispatch` only |
+| Cross-language constants (no single source of truth possible — a Go binary and the Python/TS packages have no build-time link) | `MAX_ARG_BYTES`/`MAX_ERROR_BYTES`/`MAX_DESCRIPTION_BYTES`/`MAX_OUTPUT_BYTES_CEILING`, each hand-duplicated identically in `sdk-python/agentguard/guard.py` and `sdk-ts/src/guard.ts` — a change to one is a prompt to update the other, not silent drift. `maxLineBytes` in `daemon/socket_api.go` (1 MiB) and `proxy/mcp/proxy.go` (4 MiB) share a name but are *deliberately* different values for different transports — not a row in this table, just cross-referenced at each definition. |
 
 Update this table when a canonical symbol is added or renamed.
 

@@ -1,4 +1,4 @@
-module agentguard
+module github.com/rangasai12/AgentGuard
 
 go 1.26.0
 

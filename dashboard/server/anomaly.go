@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"agentguard/dashboard/store"
-	"agentguard/engine"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/engine"
 )
 
 // anomalyMinInterval throttles detection to at most once per agent this

@@ -1,0 +1,24 @@
+name: publish-python
+
+# Manual only — publishing is never a side effect of a push or merge. See
+# RELEASING.md for the release process this fits into. Requires a
+# PYPI_TOKEN repository secret (Settings -> Secrets and variables ->
+# Actions); without it this fails clearly at the upload step rather than
+# doing anything silent.
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install build twine
+      - run: python -m build sdk-python
+      - run: twine upload sdk-python/dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 func TestParseClassifierResponse(t *testing.T) {

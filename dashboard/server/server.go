@@ -10,7 +10,7 @@ package server
 import (
 	"net/http"
 
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 // New returns the combined Control API + Web API handler.

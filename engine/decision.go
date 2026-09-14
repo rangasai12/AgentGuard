@@ -8,6 +8,9 @@ import (
 // Evaluate is the single decision function every enforcement point calls. It is
 // pure and side-effect free: same Policy + Action always yields the same Decision.
 func Evaluate(policy *Policy, action Action) Decision {
+	if err := action.Validate(); err != nil {
+		return Decision{Result: Deny, MatchedRule: "invalid-action", Reason: err.Error()}
+	}
 	switch action.Type {
 	case ActionFSRead, ActionFSWrite:
 		return evaluateFS(policy, action)
@@ -46,6 +49,7 @@ func evaluateFS(policy *Policy, action Action) Decision {
 	// filesystem-level guarantee — real symlink-based escapes require the
 	// kernel-level hardened mode (Landlock/seccomp) planned for v0.2.
 	cleanPath := path.Clean(action.Path)
+	coveredRules := 0
 	for i, r := range policy.Filesystem {
 		access, isAllow := r.Allow, true
 		if access == "" {
@@ -54,6 +58,7 @@ func evaluateFS(policy *Policy, action Action) Decision {
 		if !fsAccessCovers(access, action.Type) {
 			continue
 		}
+		coveredRules++
 		for _, pat := range r.Paths {
 			if !matchPathGlob(pat, cleanPath) {
 				continue
@@ -67,7 +72,10 @@ func evaluateFS(policy *Policy, action Action) Decision {
 			return withApproval(d, r.RequireApproval)
 		}
 	}
-	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: "no filesystem rule matched"}
+	if coveredRules > 0 {
+		return Decision{Result: Deny, MatchedRule: "default-deny", Reason: fmt.Sprintf("no filesystem rule's paths matched %s (%d rule(s) cover this access type)", cleanPath, coveredRules)}
+	}
+	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: fmt.Sprintf("no filesystem rule covers %s access to %s", action.Type, cleanPath)}
 }
 
 func evaluateNetwork(policy *Policy, action Action) Decision {
@@ -88,16 +96,28 @@ func evaluateNetwork(policy *Policy, action Action) Decision {
 			return withApproval(d, r.RequireApproval)
 		}
 	}
+	domainMatchedWrongMethod := ""
 	for i, r := range np.Allow {
-		if matchDomain(r.Domain, action.Domain) && methodAllowed(r.Methods, action.Method) {
+		if !matchDomain(r.Domain, action.Domain) {
+			continue
+		}
+		if methodAllowed(r.Methods, action.Method) {
 			d := Decision{Result: Allow, MatchedRule: fmt.Sprintf("network.allow[%d] domain:%s", i, r.Domain), Reason: r.Reason}
 			return withApproval(d, r.RequireApproval)
 		}
+		// The domain matched but the method didn't — remember it so the
+		// eventual deny names the actual mismatch (an empty or wrong
+		// action.Method used to fall all the way through to a flat "no
+		// network rule matched", with nothing pointing at the fix).
+		domainMatchedWrongMethod = fmt.Sprintf("network.allow[%d] domain:%s allows methods %v, not %q", i, r.Domain, r.Methods, action.Method)
 	}
 	if np.Default == "allow" {
 		return Decision{Result: Allow, MatchedRule: "network.default", Reason: "network.default is allow"}
 	}
-	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: "no network rule matched"}
+	if domainMatchedWrongMethod != "" {
+		return Decision{Result: Deny, MatchedRule: "default-deny", Reason: domainMatchedWrongMethod}
+	}
+	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: fmt.Sprintf("no network rule matched domain %s", action.Domain)}
 }
 
 func evaluateShell(policy *Policy, action Action) Decision {
@@ -117,7 +137,7 @@ func evaluateShell(policy *Policy, action Action) Decision {
 	if sp.Default == "allow" {
 		return Decision{Result: Allow, MatchedRule: "shell.default", Reason: "shell.default is allow"}
 	}
-	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: "no shell rule matched"}
+	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: fmt.Sprintf("command %q matched none of %d allow pattern(s)", action.Command, len(sp.Allow))}
 }
 
 func evaluateMCP(policy *Policy, action Action) Decision {
@@ -149,12 +169,15 @@ func evaluateMCP(policy *Policy, action Action) Decision {
 		if s.Default == "deny" {
 			return Decision{Result: Deny, MatchedRule: fmt.Sprintf("mcp.servers[%s].default", s.Name), Reason: "server default is deny"}
 		}
-		break
+		if mp.Default == "allow" {
+			return Decision{Result: Allow, MatchedRule: "mcp.default", Reason: "mcp.default is allow"}
+		}
+		return Decision{Result: Deny, MatchedRule: "default-deny", Reason: fmt.Sprintf("server %q matched but has no rule or default for tool %q", s.Name, action.Tool)}
 	}
 	if mp.Default == "allow" {
 		return Decision{Result: Allow, MatchedRule: "mcp.default", Reason: "mcp.default is allow"}
 	}
-	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: "no mcp rule matched for this server/tool"}
+	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: fmt.Sprintf("no mcp.servers entry named %q", action.Server)}
 }
 
 func evaluateFunction(policy *Policy, action Action) Decision {
@@ -162,10 +185,12 @@ func evaluateFunction(policy *Policy, action Action) Decision {
 	// Argument conditions are naturally written as partitioning ranges
 	// ("amount < 1000" then "amount >= 1000"), and declaration order is how
 	// you say which takes priority if ranges ever overlap.
+	nameMatched := 0
 	for i, r := range policy.Functions.Rules {
 		if r.Name != action.Name {
 			continue
 		}
+		nameMatched++
 		matched := true
 		for _, c := range r.Conditions {
 			if !conditionHolds(c, action.Args) {
@@ -190,7 +215,10 @@ func evaluateFunction(policy *Policy, action Action) Decision {
 	if policy.Functions.Default == "allow" {
 		return Decision{Result: Allow, MatchedRule: "functions.default", Reason: "functions.default is allow"}
 	}
-	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: "no functions rule matched"}
+	if nameMatched > 0 {
+		return Decision{Result: Deny, MatchedRule: "default-deny", Reason: fmt.Sprintf("function %q matched %d rule(s) by name but no condition set held", action.Name, nameMatched)}
+	}
+	return Decision{Result: Deny, MatchedRule: "default-deny", Reason: fmt.Sprintf("no functions rule named %q", action.Name)}
 }
 
 func evaluateSecret(policy *Policy, action Action) Decision {

@@ -2,8 +2,8 @@ import os
 
 import pytest
 
-from agentguard import DaemonStartError, Guard, PolicyDenied
-from agentguard.client import DaemonClient
+from agentguard import DaemonPolicyMismatch, DaemonStartError, Guard, PolicyDenied
+from agentguard.client import DaemonClient, policy_content_hash
 
 from .conftest import decision_handler
 
@@ -191,6 +191,43 @@ def test_checked_decorator_applies_defaults_before_building_action(fake_daemon):
                      "args": {"method": "GET", "domain": "api.github.com", "path": "/"}}]
 
 
+def test_checked_decorator_raises_before_evaluate_when_a_required_field_is_missing(fake_daemon):
+    # The exact bug behind the "no network rule matched" complaint: a
+    # field_map that forgets `method=` for a network action used to reach
+    # the daemon with an empty method and fall through to a generic deny.
+    # It must now raise client-side, before any socket round trip at all.
+    seen = []
+
+    def handler(req):
+        if req.get("cmd") == "ping":
+            return {"ok": True}
+        seen.append(req)
+        return {"ok": True, "decision": {"result": "deny"}}
+
+    d = fake_daemon(handler)
+    guard = Guard(policy="unused.yaml", client=DaemonClient(d.socket_path))
+
+    @guard.checked("network", domain="domain")  # method= omitted
+    def http_request(domain):
+        return "should not run"
+
+    with pytest.raises(ValueError, match="method"):
+        http_request("api.github.com")
+    assert seen == [], "expected no evaluate call to have been sent at all"
+
+
+def test_checked_decorator_raises_for_missing_secret_env_var(fake_daemon):
+    d = fake_daemon(action_decision_handler({}))
+    guard = Guard(policy="unused.yaml", client=DaemonClient(d.socket_path))
+
+    @guard.checked("secret_env")  # env_var= omitted
+    def read_secret():
+        return "should not run"
+
+    with pytest.raises(ValueError, match="env_var"):
+        read_secret()
+
+
 def test_checked_decorator_supports_computed_fields(fake_daemon):
     seen = []
 
@@ -203,13 +240,13 @@ def test_checked_decorator_supports_computed_fields(fake_daemon):
     d = fake_daemon(handler)
     guard = Guard(policy="unused.yaml", client=DaemonClient(d.socket_path))
 
-    @guard.checked("network", domain="domain", is_ip_literal=lambda args: args["domain"] == "1.2.3.4")
-    def http_request(domain):
+    @guard.checked("network", domain="domain", method="method", is_ip_literal=lambda args: args["domain"] == "1.2.3.4")
+    def http_request(domain, method="GET"):
         return "should not run"
 
     with pytest.raises(PolicyDenied):
         http_request("1.2.3.4")
-    assert seen == [{"type": "network", "domain": "1.2.3.4", "is_ip_literal": True, "args": {"domain": "1.2.3.4"}}]
+    assert seen == [{"type": "network", "domain": "1.2.3.4", "method": "GET", "is_ip_literal": True, "args": {"domain": "1.2.3.4", "method": "GET"}}]
 
 
 def test_function_decorator_passes_all_args_with_zero_config(fake_daemon):
@@ -341,6 +378,54 @@ def test_guard_raises_daemon_start_error_when_agentctl_missing(tmp_path):
         )
 
 
+def test_ensure_daemon_rejects_stale_policy(fake_daemon, tmp_path):
+    # A daemon answering ping at the (correctly-scoped) socket with a
+    # policy_hash that doesn't match our own policy file on disk means the
+    # file was edited since that daemon started — this must fail loudly,
+    # not silently run under the stale rules.
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text("version: 1\n")
+    stale_hash = "0" * 12
+    assert policy_content_hash(str(policy_file)) != stale_hash
+    d = fake_daemon(decision_handler({}, policy_hash=stale_hash, policy_path=str(policy_file)))
+    with pytest.raises(DaemonPolicyMismatch):
+        Guard(
+            policy=str(policy_file),
+            socket_path=d.socket_path,
+            auto_start=True,
+            agentctl_path="definitely-not-a-real-binary-xyz",
+        )
+
+
+def test_ensure_daemon_accepts_matching_policy_hash(fake_daemon, tmp_path):
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text("version: 1\n")
+    correct_hash = policy_content_hash(str(policy_file))
+    d = fake_daemon(decision_handler({}, policy_hash=correct_hash))
+    guard = Guard(
+        policy=str(policy_file),
+        socket_path=d.socket_path,
+        auto_start=True,
+        agentctl_path="definitely-not-a-real-binary-xyz",
+    )
+    assert guard.check("anything")["result"] == "deny"
+
+
+def test_ensure_daemon_skips_check_when_daemon_predates_policy_hash(fake_daemon, tmp_path):
+    # A daemon that answers ping with no policy_hash at all (predates this
+    # check) must still be accepted, same as before it existed.
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text("version: 1\n")
+    d = fake_daemon(decision_handler({}))
+    guard = Guard(
+        policy=str(policy_file),
+        socket_path=d.socket_path,
+        auto_start=True,
+        agentctl_path="definitely-not-a-real-binary-xyz",
+    )
+    assert guard.check("anything")["result"] == "deny"
+
+
 # ---------------------------------------------------------------------------
 # Outcome reporting and run/version identity
 # ---------------------------------------------------------------------------
@@ -390,6 +475,16 @@ def test_output_is_truncated_and_hashed(fake_daemon):
     import hashlib
 
     assert outcome["output_sha256"] == hashlib.sha256(big.encode()).hexdigest()
+
+
+def test_max_output_bytes_is_clamped_to_a_hard_ceiling(fake_daemon):
+    # An unbounded max_output_bytes could build a `report` line exceeding
+    # the daemon socket's 1 MiB line limit, which then silently stalls
+    # with no error surfaced. Guard must clamp, not trust the caller.
+    from agentguard.guard import MAX_OUTPUT_BYTES_CEILING
+
+    guard = make_guard(fake_daemon, {}, max_output_bytes=10_000_000)
+    assert guard.max_output_bytes == MAX_OUTPUT_BYTES_CEILING
 
 
 def test_capture_output_off_still_reports_status_and_timing(fake_daemon):
@@ -446,6 +541,16 @@ def test_run_id_and_agent_version_sent_on_evaluate(fake_daemon, monkeypatch):
 
     assert os.environ["AGENTGUARD_RUN_ID"] == guard.run_id
     assert os.environ["AGENTGUARD_AGENT_VERSION"] == "2.3.4"
+
+
+def test_run_id_fallback_format(fake_daemon, monkeypatch):
+    # secrets.token_hex(8): 16 lowercase hex chars, same shape as the TS
+    # SDK's randomBytes(8).toString("hex") fallback (see CHANGELOG "Fix 5").
+    import re
+
+    monkeypatch.delenv("AGENTGUARD_RUN_ID", raising=False)
+    guard = make_guard(fake_daemon, {})
+    assert re.fullmatch(r"[0-9a-f]{16}", guard.run_id), guard.run_id
 
 
 def test_run_id_inherited_from_environment(fake_daemon, monkeypatch):

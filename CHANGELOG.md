@@ -2008,3 +2008,586 @@ user to fill in, and a commented-out `AGENTGUARD_CLASSIFIER_MODEL`.
   trims double and single quotes, skips comments/blank lines/malformed
   lines), `TestLoadDotEnvNeverOverridesARealEnvVar`, `TestLoadDotEnvMissingFileIsANoOp`.
 - Guardrail grep: `askLLM`, `loadDotEnv` each have exactly one definition.
+
+## Fix 1 — Policy-scoped daemon + audit log by default; stale-policy check as the safety net
+
+### Why
+
+An external developer trying AgentGuard hit a silent failure: this
+machine already had an unrelated daemon running from a prior session on
+the fixed, machine-wide default socket path, and their `Guard()` silently
+talked to that daemon's policy instead of theirs — they found it by
+noticing a stale process, not from any error message. A follow-up deep
+dive (three parallel read-only searches for the same failure shape
+elsewhere in the system) found the identical bug repeated twice more:
+`agentguard-forwarder`'s default state-file path and `agentctl proxy
+start`'s default listen address. All three are fixed together here, plus
+the one thing plain path-scoping cannot catch on its own: the *same*
+policy file edited on disk after its daemon already started.
+
+### What changed
+
+**Policy-scoped defaults.** `cli.DefaultSocketPath`/`DefaultAuditLogPath`
+(`cli/paths.go`) now take a `policyPath` argument: the default becomes
+`~/.agentguard/daemons/<sha256(abspath(policyPath))[:12]>/{agentguard.sock,audit.log}`
+instead of one fixed path per machine, so two agents pointed at two
+different policy files get two different daemons and two different logs
+automatically, with nothing to configure. `AGENTGUARD_SOCKET`/
+`AGENTGUARD_AUDIT_LOG` still override outright, unchanged. Passing `""`
+keeps the single pre-scoping global path, for the one caller with no
+policy of its own (`agentguard-forwarder`, which only ever tails whatever
+`--socket`/`--audit-log` it's pointed at). Mirrored exactly (same sha256
+algorithm, over the absolute path string) in
+`sdk-python/agentguard/client.py`'s `default_socket_path`/
+`default_audit_log_path`/`_policy_scope` and
+`sdk-ts/src/client.ts`'s `defaultSocketPath`/`defaultAuditLogPath`/
+`policyScope`, so a plain `agentctl daemon start --policy foo.yaml` and a
+plain `Guard(policy="foo.yaml")`, run with no explicit socket flags
+anywhere, land on the same socket without either one telling the other
+where it is. `cli/daemon_cmd.go`, `cli/proxy_cmd.go`, and
+`cli/mcp_proxy_cmd.go` now resolve their `--socket`/`--audit` defaults
+after parsing `--policy` (a flag default can't depend on another flag's
+value at declaration time); the four socket-only subcommands with no
+`--policy` flag of their own (`approve`, `deny`, `pending`, `audit`,
+`policy record`) assume `./policy.yaml`, matching `daemon start`'s own
+default.
+
+**Refuse to clobber a live daemon.** `daemon.Serve` (`daemon/socket_api.go`)
+gained a `force bool` parameter and a new `checkNoLiveDaemon`: unless
+`force` is true, it dials the target socket first and, if something
+already answers the daemon ping protocol there, refuses to start rather
+than `os.RemoveAll`-ing that daemon's socket out from under it (which used
+to silently orphan a running daemon on every restart at the same path).
+`agentctl daemon start` gained a `--force` flag to opt into today's
+clobber behavior when that's genuinely wanted.
+
+**Daemon identity over ping.** `Response` (`daemon/socket_api.go`) gained
+`PolicyHash`/`PolicyPath`; the `"ping"` handler now returns them from the
+daemon's loaded policy and its new `Daemon.PolicyPath` field (set once by
+`cli/daemon_cmd.go` after `daemon.New`, alongside the existing
+`policy.Hash`). `Guard._ensure_daemon` (Python) and `Guard.ensureDaemon`
+(TS) now compare a successful ping's `policy_hash` against their own
+policy file's content hash — computed fresh from disk each time, via new
+`policy_content_hash`/`policyContentHash` (sha256 of the raw file bytes,
+first 12 hex chars, exactly `engine.ParsePolicy`'s algorithm — a
+*different* hash from the path-hash above, which only picks a directory
+name) — and raise a new `DaemonPolicyMismatch`/`DaemonPolicyMismatchError`
+on mismatch rather than silently running under stale rules. A daemon that
+predates this check (no `policy_hash` in its ping response) is still
+accepted, unchanged from before.
+
+**The two same-shape bugs found in the deep dive.**
+`cmd/agentguard-forwarder/main.go`'s `--state` default now derives from
+the *resolved* `--audit-log` value actually in use, not a fresh call to
+the global default — two forwarders each pointed at a different
+`--audit-log` no longer collide on one shared state file and overwrite
+each other's `api_key`/`agent_id`/read-offset. New `cli.DefaultProxyAddr`
+adds the `AGENTGUARD_PROXY_ADDR` env-var override `agentctl proxy start`'s
+`--addr` was missing (every other default in this package already checks
+an env var first); two proxy instances no longer have to collide on
+`127.0.0.1:8080` before either one can be told apart.
+
+### Guardrail: why new code
+
+- **`Daemon.PolicyPath`.** New field on the existing `Daemon` struct, not
+  a new type — nothing tracked which file a running daemon's policy came
+  from until the ping response needed to report it.
+- **`checkNoLiveDaemon`, `DefaultProxyAddr`, `policyScope`/`defaultPath`
+  (Go), `_policy_scope`/`_default_path`/`policy_content_hash` (Python),
+  `policyScope`/`policyContentHash` (TS).** No existing symbol did any of
+  this; each is the one implementation of its concern, called from every
+  site that needs it rather than re-implemented per caller.
+- **`DaemonPolicyMismatch`/`DaemonPolicyMismatchError`.** New exception
+  types, but deliberately not reusing `PolicyDenied` (a decision, not a
+  connectivity/identity problem) or `DaemonUnavailable` (the daemon *is*
+  reachable here) — a stale-policy mismatch is neither.
+- **Everything else** (`Serve`'s new parameter, `Response`'s two new
+  fields, the CLI commands' restructured flag defaults) extends an
+  existing function/struct/flag set in place; grepped after landing to
+  confirm no second `Serve`, no second `Response`, no second socket/audit
+  default helper was introduced anywhere.
+
+### Deferred / known gaps
+
+- The path-hash (`policyScope`) and the content-hash
+  (`policy_content_hash`) are two different, deliberately unrelated
+  hashes over the same file — the former only needs to be a stable,
+  collision-safe directory name (hashing the *path*), the latter must
+  byte-for-byte match `engine.ParsePolicy` (hashing the *contents*). Easy
+  to confuse; each is named and commented to say which one it is at every
+  definition site.
+- `checkNoLiveDaemon`'s dial-and-ping probe uses a 200ms timeout; an
+  extremely slow or overloaded daemon could in theory be misjudged as
+  "not running" and get clobbered even without `--force`. Not observed in
+  practice; documented rather than tuned blind.
+- The four socket-only CLI subcommands (`approve`, `pending`, `audit`,
+  `policy record`) guess `./policy.yaml` for scoping purposes; a user
+  running them from a directory whose daemon was started against a
+  differently-named policy file must still pass `--socket` explicitly.
+  No `--policy` flag was added to these commands — they never load a
+  policy today, and adding one just to name a socket felt like more
+  surface than the fix warranted.
+
+### Verification run at this milestone
+
+- `go build ./...` and `go vet ./...` — clean.
+- `go test -race ./cli/... ./daemon/... ./engine/... ./proxy/... ./cmd/agentguard-forwarder/...`
+  — all pass, including new `cli/paths_test.go`
+  (`TestDefaultSocketPathVariesByPolicy`,
+  `TestDefaultSocketPathStableForSamePolicy`,
+  `TestDefaultSocketPathAndAuditLogPathScopeTogether`,
+  `TestDefaultSocketPathEnvOverride`,
+  `TestDefaultSocketPathEmptyPolicyKeepsGlobalPath`,
+  `TestDefaultProxyAddrEnvOverride`) and new
+  `daemon/socket_api_test.go` cases (`TestSocketAPIPing` extended to
+  assert `PolicyHash`/`PolicyPath`; new
+  `TestServeRefusesToClobberALiveDaemon`, covering both the refusal and
+  the `force:true` takeover).
+- `cd sdk-python && pytest -q` — 62 passed (up from 54), including new
+  `test_client.py` cases for the scoped path helpers and `policy_content_hash`,
+  and new `test_guard.py` cases
+  (`test_ensure_daemon_rejects_stale_policy`,
+  `test_ensure_daemon_accepts_matching_policy_hash`,
+  `test_ensure_daemon_skips_check_when_daemon_predates_policy_hash`).
+- `cd sdk-ts && npm test` — 50 passed (up from 42), including the TS
+  mirrors of all of the above in `test/client.test.ts` and
+  `test/guard.test.ts`.
+- Guardrail grep: `Serve(`, `checkNoLiveDaemon(`, `DefaultProxyAddr(`
+  each have exactly one non-test definition; `default_socket_path`/
+  `defaultSocketPath` each still have exactly one definition per language.
+
+## Fix 2 — `Action.Validate()` across every action type; fix `secret_env`'s default-allow gap
+
+### Why
+
+The same developer's "no network rule matched" complaint (a forgotten
+`method` field silently reaching the daemon and falling through to a
+flat, uninformative deny) turned out to be one instance of a repeated
+shape, confirmed by reading every matcher in `engine/match.go` and every
+default-deny branch in `engine/decision.go`: `fs` (`Path`), `shell`
+(`Command`), `mcp_tool` (`Server`/`Tool`), and `function` (`Name`) all
+have the same "empty required field silently unmatchable, no validation,
+generic deny reason" gap. `secret_env` is worse, not the same:
+`evaluateSecret` is *default-allow*, so an empty `EnvVar` matches no deny
+rule and is silently **allowed** — a security gap, not just a confusing
+error. `engine.Policy.Validate` already requires every one of these
+fields on the rule side at load time; there was simply no equivalent
+check on the runtime `Action` side.
+
+### What changed
+
+New `Action.Validate() error` (`engine/types.go`): one method, one switch
+on `Action.Type`, checking exactly the required field(s) each type's
+matcher needs (`Path` for fs, `Domain`+`Method` for network, `Command`
+for shell, `Server`+`Tool` for mcp_tool, `Name` for function, `EnvVar`
+for secret_env). `Evaluate` (`engine/decision.go`) calls it first, before
+any type-specific `evaluate*` function runs, and denies with
+`MatchedRule: "invalid-action"` on failure — this is what actually closes
+the `secret_env` gap: an invalid action never reaches the default-allow
+branch at all.
+
+Every default-deny branch that used to be a flat, generic literal now
+names what actually diverged: filesystem says how many rules cover this
+access type and that none of their paths matched; network says either
+the unmatched domain, or — the developer's exact scenario — the domain
+that *did* match and which methods it allows versus the one that was
+sent; shell names the command; mcp_tool distinguishes "no server named
+X" from "server X matched but has no rule or default for tool Y"; function
+distinguishes "no rule named X" from "X matched by name but no condition
+set held".
+
+`sdk-python/agentguard/guard.py`'s `checked()` decorator gained
+`_validate_action_fields` (new module-level function) plus
+`_REQUIRED_ACTION_FIELDS` (the same per-type table as `Action.Validate`,
+independently maintained since it's a different language), called inside
+`build_action` right before the action dict is returned — so a `field_map`
+that forgets a required field raises `ValueError` client-side, before any
+socket round trip, closer to the developer than the Go-side fix. (The TS
+SDK has no equivalent typed action-building API — `wrapAttr`/`toolAction`
+only ever build `mcp_tool` actions, which always carry `server`/`tool` —
+so this client-side guard is Python-only; not a gap this fix needed to
+close, since the capability it would guard doesn't exist there.)
+
+### Guardrail: why new code
+
+- **`Action.Validate`.** New method on the existing `Action` type — no
+  validation of the runtime action existed anywhere; `Policy.Validate`
+  already covers the equivalent rule-side fields, so this is that
+  guarantee's missing other half, not a duplicate of it.
+- **`_validate_action_fields` / `_REQUIRED_ACTION_FIELDS` (Python).** No
+  client-side required-field check existed; mirrors `Action.Validate`'s
+  table by necessity (two languages), not by choice — noted here rather
+  than pretending one shared source of truth is possible across a Go
+  binary and a Python package with no build-time link between them.
+- **Every default-deny reason string.** Extends the existing literal at
+  each of the six call sites in place; no second reason-formatting helper
+  was introduced — each type's "closest match" context differs enough
+  (a path glob miss vs. a method mismatch vs. a name-matched-but-condition-
+  failed function rule) that a single generic formatter would have had to
+  take a bag of type-specific parts anyway, so the six call sites just
+  build their own string directly.
+
+### Deferred / known gaps
+
+- The TS SDK's client-side validation gap noted above: if a typed,
+  field-mapped action-building API is ever added to `sdk-ts` (there's no
+  current plan to), it will need the same `_REQUIRED_ACTION_FIELDS`-style
+  table ported to TypeScript at that point, not before.
+- `Action.Validate`'s messages are the only source of truth for "what's
+  required" now duplicated in three places by necessity (the Go method,
+  the Python table, and implicitly `Policy.Validate`'s rule-side checks);
+  a future required field added to one action type must be added to all
+  three, and nothing currently enforces that mechanically beyond this
+  entry and the registry in `docs/conventions.md`.
+
+### Verification run at this milestone
+
+- `go build ./...` and `go vet ./...` — clean.
+- `go test -race ./engine/...` — all pass, including new
+  `engine/types_test.go` cases (`TestActionValidateRequiresFieldPerType`,
+  table-driven over all seven action types;
+  `TestActionValidateRejectsEmptySecretEnvVar`) and new
+  `engine/decision_test.go` cases
+  (`TestNetworkDenyReasonNamesTheMethodMismatch`,
+  `TestNetworkDenyReasonForUnlistedDomain`,
+  `TestFilesystemDenyReasonNamesThePathAndCoverageCount`,
+  `TestFilesystemDenyReasonWhenNoRuleCoversTheAccessType`,
+  `TestShellDenyReasonNamesTheCommandAndPatternCount`,
+  `TestMCPDenyReasonDistinguishesServerMatchFromNoServer`,
+  `TestFunctionDenyReasonDistinguishesNameMatchFromNoRule`).
+- `go test -race -p 1 ./...` (full monorepo, dedicated
+  `AGENTGUARD_DASHBOARD_TEST_DB`) — all pass. Note: an initial run without
+  `-p 1` showed two unrelated failures
+  (`TestForwarderShipsNewAuditEvents`, `TestDetectAnomaliesAllKinds`)
+  from cross-package Postgres test-DB races, confirmed pre-existing by
+  reproducing them against a `git stash`-ed pre-Fix-1/2 checkout — not a
+  regression from this change, and gone once run the way
+  `docs/conventions.md` already documents.
+- `cd sdk-python && pytest -q` — 64 passed, including new
+  `test_checked_decorator_raises_before_evaluate_when_a_required_field_is_missing`
+  and `test_checked_decorator_raises_for_missing_secret_env_var`; one
+  pre-existing test
+  (`test_checked_decorator_supports_computed_fields`) updated to include
+  `method=` in its field_map — it was testing the IP-literal deny path,
+  which never depended on method, but a real network action always
+  carries one, so the test's omission was a shortcut, not a case this
+  fix needed to accommodate.
+- `cd examples/openai-coding-agent && pytest -q` — 13 passed, unaffected
+  (its `@guard.checked(...)` call sites already set every required
+  field).
+- `cd sdk-ts && npm test` — 50 passed, unaffected (Fix 2 has no TS-side
+  change).
+- Guardrail grep: `func (a Action) Validate`, `_validate_action_fields`
+  each have exactly one definition.
+
+## Fix 3 — Cloud onboarding CLI command + API reference doc
+
+### Why
+
+The same external developer had no way to get from "I have no account" to
+"I have a running `agentguard-forwarder`" without either clicking through
+the dashboard's browser UI or reverse-engineering the REST calls by
+reading frontend source — which is how they discovered, the hard way,
+that `POST /api/agents` takes `tenant_id` as a query parameter while
+`name` rides in the JSON body, a convention documented nowhere.
+
+### What changed
+
+New `agentctl cloud signup` and `agentctl cloud agents create`
+(`cli/cloud_cmd.go`), wired into the existing dispatch switch in
+`cli/cli.go`. `signup` calls `POST /api/signup`, captures the `ag_session`
+cookie from the response, and saves it plus the new tenant id to a small
+JSON state file (new `cloudSessionState`, default
+`~/.agentguard/cloud-session.json`, override via `--state` or
+`AGENTGUARD_CLOUD_SESSION`) — the same shape of problem and fix as
+`cmd/agentguard-forwarder`'s `forwarderState`, not a shared type since the
+two binaries have no common package to put one in. `agents create`
+replays that cookie against `POST /api/agents?tenant_id=...`, prints the
+registration token, and — with `--register` — runs `agentguard-forwarder
+-register-token=<token> -once` itself, so the whole signup → agent →
+registered flow is two commands with no browser and no request built by
+hand.
+
+New `cloudClient` (`cli/cloud_cmd.go`): a small, session-cookie
+client for the two `/api/...` calls above. Deliberately not reusing
+`cmd/agentguard-forwarder`'s `httpClient` — that one is bearer-token
+authenticated against the agent-facing `/v1/...` Control API, a different
+auth scheme and endpoint set, and it lives in package `main` of a
+different binary, so it isn't importable from `cli` even if the shapes
+matched.
+
+New `docs/api-reference.md`: the three-endpoint contract (signup → create
+agent → register) exactly as verified against the handlers in
+`dashboard/server/webapi.go`/`controlapi.go` and the frontend's own
+`dashboard/web/src/api/client.ts` — method, path, JSON-body vs.
+query-param for every field, a `curl` example and response shape per
+endpoint, called out explicitly where `tenant_id` is a query param. One-line
+pointers added from `README.md`'s cloud-dashboard quick-start section and
+`docs/conventions.md`'s registry.
+
+### Guardrail: why new code
+
+- **`cli/cloud_cmd.go`'s commands, `cloudClient`, `cloudSessionState`.**
+  No CLI wrapper for any part of this flow existed at all —
+  `cli/cli.go`'s dispatch table had nothing for signup/login/agent
+  registration, confirmed by reading it before writing this. All new,
+  not a duplicate of anything.
+- **`docs/api-reference.md`.** No API reference doc existed anywhere in
+  the repo (`docs/sdk-guide.md` covers the SDKs, not the dashboard REST
+  API); genuinely new, not a second copy of an existing doc.
+
+### Deferred / known gaps
+
+- `--password` is a required flag, not prompted with echo disabled — the
+  project has no dependency capable of a no-echo terminal read
+  (`golang.org/x/term` isn't currently a dependency, and adding one for
+  this alone didn't seem worth it) and inventing a half-finished prompt
+  felt worse than a documented flag. The password is visible in shell
+  history/process listings as a result; noted, not hidden.
+- `cloud signup` only ever creates a brand-new tenant (that's what
+  `POST /api/signup` does); there's no `agentctl cloud login` for an
+  existing account, and no way to list/switch between multiple tenants a
+  user already belongs to (`GET /api/me`'s `memberships` would back
+  that, but it wasn't asked for here and is a real follow-up).
+- `agents create --register` shells out to whatever `agentguard-forwarder`
+  it finds on `PATH` (or `--forwarder-path`) with `-once`; it does not
+  itself start the long-running forwarder loop — the user still runs that
+  separately afterward, same as today.
+
+### Verification run at this milestone
+
+- `go build ./...` and `go vet ./...` — clean.
+- `go test -race ./cli/...` — all pass, including new
+  `cli/cloud_cmd_test.go` (`TestCloudSignupThenAgentsCreateSendsExactRequestShapes`,
+  against an `httptest.Server` stub asserting `tenant_id` arrives as a
+  query param and `name`/`company_name`/`email`/`password` as JSON body
+  fields — exactly the convention that would have caught the original
+  complaint up front — plus cookie replay; and
+  `TestCloudAgentsCreateWithoutSignupFailsWithAHelpfulError`).
+- `go test -race -p 1 ./...` (full monorepo, dedicated
+  `AGENTGUARD_DASHBOARD_TEST_DB`) — all pass.
+- Manual: `docs/api-reference.md`'s three `curl` examples read correctly
+  against the handler code in `dashboard/server/webapi.go` and
+  `controlapi.go` (not run against a live server in this session — no
+  `agentguard-cloud` instance was running with a fresh database at the
+  time of this fix; the CLI test above exercises the same request shapes
+  against a stub instead).
+- Guardrail grep: `runCloud`, `cloudClient`, `cloudSessionState`,
+  `DefaultCloudSessionPath` each have exactly one definition, all in
+  `cli/cloud_cmd.go`.
+
+## Fix 4 — Packaging: publish-ready SDKs/CLI, versioning policy, CI
+
+### Why
+
+Nothing in this repo is published anywhere — no PyPI package, no npm
+package, and `go install` can't work against it at all. All three are
+fixable without inventing anything new: `sdk-python/pyproject.toml` and
+`sdk-ts/package.json` were already valid, minimal package manifests; the
+only real blocker was `go.mod`'s module path having no host prefix, plus
+the complete absence of `.github/` (zero CI, zero release automation) and
+any stated stability expectation for a project the linked developer
+fairly called "genuinely early-stage."
+
+### What changed
+
+**`go.mod`**: `module agentguard` → `module
+github.com/rangasai12/AgentGuard` (the repo's actual remote). Every
+internal import across all 46 Go files updated to match
+(mechanical `"agentguard/..."` → `"github.com/rangasai12/AgentGuard/..."`
+rename, verified by `go build ./...`/`go vet ./...`/the full test suite,
+not a design change). This is what unblocks
+`go install github.com/rangasai12/AgentGuard/cli/cmd/agentctl@latest` for
+anyone outside this checkout — documented in `README.md`'s "Build the
+CLI" section alongside the existing `go build` instructions, not instead
+of them.
+
+**`sdk-python/agentguard/__init__.py`**: new `__version__`, read via
+`importlib.metadata.version("agentguard")` with a `"0.0.0-dev"` fallback
+when the package isn't installed (running straight from a checkout). The
+single source of truth stays `pyproject.toml`'s `version` field — this
+reads it back, never restates it.
+
+**`sdk-ts/package.json`**: added `files: ["src", "README.md"]` and
+`exports: {".": "./src/index.ts"}`. Per the confirmed decision to keep
+shipping raw TypeScript (matches the SDK's existing native-Node-execution,
+zero-dependency design — no `dist/`, no `tsc`, no new devDependency):
+`npm pack --dry-run` now excludes `test/` from what gets published, where
+before it would have shipped the whole tree.
+
+**New `RELEASING.md`** (root): states the pre-1.0 stability policy
+(breaking changes possible between minor versions until `1.0.0`) and the
+three-package release process (bump whichever version(s) changed, tag,
+run the matching publish workflow). `README.md`'s Status section gets a
+one-sentence pointer to it.
+
+**New `.github/workflows/`** (none existed before — all four files below
+are new, not duplicates of anything): `test.yml` runs on every push/PR,
+three jobs (Go against a real Postgres service container, Python, and
+TypeScript + the dashboard frontend build) running the exact commands
+`docs/conventions.md`'s "Running the tests" section already tells a
+contributor to run by hand, enforcing that contract rather than inventing
+a second one. `publish-python.yml`, `publish-npm.yml`, `publish-cli.yml`
+are each `workflow_dispatch`-only (never triggered by a push or merge) —
+build-and-upload to PyPI/npm/a GitHub Release respectively.
+`publish-python.yml`/`publish-npm.yml` need `PYPI_TOKEN`/`NPM_TOKEN`
+repository secrets the user still has to add before either can actually
+publish; `publish-cli.yml` only needs the built-in `GITHUB_TOKEN`.
+
+### Guardrail: why new code
+
+- **The four `.github/workflows/*.yml` files, `RELEASING.md`.** No CI, no
+  release automation, and no versioning-policy doc existed anywhere in
+  the repo (confirmed by there being no `.github/` directory at all) — a
+  clean install for each concern, not a second implementation.
+- **Everything else** (`go.mod`'s module line, `__init__.py`'s
+  `__version__`, `package.json`'s `files`/`exports`) extends an existing
+  file/manifest in place; no second manifest, no second version symbol
+  was introduced anywhere.
+
+### Deferred / known gaps
+
+- None of the publish workflows have actually been run — they can't be,
+  from this environment, and need `PYPI_TOKEN`/`NPM_TOKEN` secrets added
+  to the GitHub repo first regardless. Their YAML was validated for
+  syntax (`yaml.safe_load`) but not executed end-to-end against the real
+  registries.
+- `test.yml`'s Postgres service uses a plain `postgres://...@localhost`
+  TCP DSN (via `AGENTGUARD_DASHBOARD_TEST_DB`), different from this
+  project's local dev convention of a Unix-socket-style
+  `postgres:///dbname` DSN (`docs/conventions.md`) — CI environments
+  don't have the same peer-auth Unix socket available, so this is a
+  deliberate, necessary difference, not an inconsistency to fix.
+- `publish-cli.yml` builds four platform binaries (linux/darwin ×
+  amd64/arm64) but doesn't code-sign the macOS ones; a downloaded darwin
+  binary will need a Gatekeeper bypass until that's addressed separately.
+
+### Verification run at this milestone
+
+- `go build ./...`, `go vet ./...`, `gofmt -l .` (empty output) — clean
+  after the module rename.
+- `go test -race -p 1 ./...` (full monorepo, dedicated
+  `AGENTGUARD_DASHBOARD_TEST_DB`) — all pass, every package now reporting
+  under `github.com/rangasai12/AgentGuard/...`.
+- `grep -rln '"agentguard/' --include=*.go .` — zero matches (no stray
+  old-module import left anywhere).
+- `pip install -e sdk-python && python3 -c "import agentguard; print(agentguard.__version__)"`
+  — printed `0.1.0`.
+- `cd sdk-python && pytest -q` — 64 passed, unaffected.
+- `cd sdk-ts && npm pack --dry-run` — tarball contents confirmed to
+  exclude `test/`; `npm test` — 50 passed, unaffected.
+- `python3 -c "import yaml; [yaml.safe_load(open(f)) for f in [...]]"` over
+  all four new workflow files — parsed without error.
+- Guardrail grep: exactly one `module` line in `go.mod`; exactly one
+  `__version__` assignment in `sdk-python/agentguard/__init__.py`.
+- **Correction, found while verifying Fix 5**: the module-path grep above
+  was scoped to `--include=*.go` and missed a non-Go reference —
+  `examples/openai-coding-agent/tests/conftest.py` shelled out to
+  `go build ... agentguard/cli/cmd/agentctl` (the old bare module path as
+  a build target string), which broke that example's test suite
+  (`subprocess.CalledProcessError` from `go build`) the moment `go.mod`
+  changed. Fixed by using the relative path `./cli/cmd/agentctl` instead
+  of a module-path string at all — sidesteps this exact bug class for any
+  future rename, not just papers over this one instance. `pytest -q` in
+  `examples/openai-coding-agent` now passes (13 passed); recorded here
+  rather than silently folded into Fix 4 after the fact.
+
+## Fix 5 — Cross-language consistency hygiene
+
+### Why
+
+The same deep dive behind Fixes 1/2 found several smaller instances of
+one underlying pattern: a value or format meant to be "one thing" is
+instead hand-duplicated (across Go/Python/TS, or across two call sites in
+one language) with no shared source of truth, and in one case that drift
+was actively latent — masked only by dead code. None of these were as
+severe as Fixes 1/2, but each is the same failure shape, so they're
+bundled here rather than left as loose ends.
+
+### What changed
+
+**Removed `daemon.SetOutputPreviewBytes` and `MaxOutputPreviewBytes`**
+(`daemon/audit.go`) — a configurable output-preview ceiling with zero
+production callers (only a test exercised it directly). Its existence is
+what let `dashboard/server/controlapi.go`'s ingest-limit comment claim a
+safety margin (500 events/batch × a 64 KiB ceiling ≈ 32 MiB, actually
+*over* the 16 MiB `maxIngestBytes` cap) that was only true by luck at
+today's fixed 4 KiB default. `AuditLogger.Report` now always truncates to
+the fixed `DefaultOutputPreviewBytes` constant; the comment's math is
+fixed against that reality. `cmd/agentguard-forwarder/main.go`'s
+`readNewEvents` gained a `maxBytes` parameter (new `maxShipBytes`
+constant, 8 MiB) alongside its existing `maxEvents` one, and a `hasMore`
+return value so `shipNewEvents`'s loop-until-drained logic can tell "a
+cap stopped this batch" apart from "the log is drained" — the safety
+margin is now structural (bounded by both count and bytes on every
+batch), not just numerically true at one fixed constant.
+
+**SDK output-size ceiling**: new `MAX_OUTPUT_BYTES_CEILING` (64 KiB,
+`sdk-python/agentguard/guard.py` and `sdk-ts/src/guard.ts`, hand-duplicated
+like the other cross-language constants). `Guard`'s `max_output_bytes`/
+`maxOutputBytes` now clamp to it in both SDKs, so a caller-configured
+value can no longer build a `report` request line that exceeds the
+daemon socket's 1 MiB line limit and silently stalls the connection.
+
+**`run_id` fallback format**: Python's fallback
+(`uuid.uuid4().hex[:16]`) changed to `secrets.token_hex(8)` — same shape
+(16 lowercase hex chars from a CSPRNG) as the TS SDK's
+`randomBytes(8).toString("hex")` fallback, which it was quietly weaker
+than (a fixed UUID version nibble at a known offset inside the slice, for
+what's meant to be one "opaque random id" concept). Only the
+auto-generated fallback moves; a caller-supplied `run_id` is unaffected.
+
+**Cross-reference comments, no behavior change**: `daemon/socket_api.go`'s
+`maxLineBytes` (1 MiB) and `proxy/mcp/proxy.go`'s `maxLineBytes` (4 MiB)
+now each point at the other and say the difference is intentional (two
+transports, two payload shapes) rather than drift. `MAX_ARG_BYTES`/
+`MAX_ERROR_BYTES`/`MAX_DESCRIPTION_BYTES` (and the new
+`MAX_OUTPUT_BYTES_CEILING`) in both SDKs now say explicitly that they're
+hand-duplicated by necessity and point at `docs/conventions.md`'s new
+cross-language-constants registry row, so a future change to one is a
+documented prompt to update the other.
+
+### Guardrail: why new code
+
+- **`maxShipBytes`, the `readNewEvents`/`shipNewEvents` byte-budget
+  logic, `moreCompleteLines`.** Extends the existing count-bounded
+  batching in place — no second batching path was added.
+- **`MAX_OUTPUT_BYTES_CEILING` (Python and TS).** New constants, but the
+  same kind of necessary per-language duplication as the three constants
+  next to them, not a duplicate of anything within either language.
+- **Everything else** (the removed dead code, the comment fixes) is
+  subtraction and documentation, not new code.
+
+### Deferred / known gaps
+
+- The cross-language constants (`MAX_ARG_BYTES` and friends) still have
+  no mechanical check that the Python and TS values actually match today
+  — the comments are a documented prompt for a human, not an enforced
+  invariant. A CI step diffing the two would close that gap; not added
+  here, since it would be the first cross-package-language test of its
+  kind in this repo and felt like more infrastructure than five small
+  constants justify on their own.
+
+### Verification run at this milestone
+
+- `go build ./...`, `go vet ./...`, `gofmt -l .` (empty) — clean.
+- `go test -race ./daemon/... ./cmd/agentguard-forwarder/...` — all pass,
+  including the trimmed `TestAuditReportTruncatesOversizedOutput` (the
+  `SetOutputPreviewBytes`-specific half removed along with the method)
+  and new `TestReadNewEventsRespectsByteBudget` (byte cap truncates a
+  batch and reports `hasMore=true`; an under-sized budget still ships at
+  least one line rather than stalling; a large-enough budget drains the
+  file and reports `hasMore=false`).
+- `go test -race -p 1 ./...` (full monorepo) — all pass.
+- `cd sdk-python && pytest -q` — 66 passed, including new
+  `test_max_output_bytes_is_clamped_to_a_hard_ceiling` and
+  `test_run_id_fallback_format`.
+- `cd sdk-ts && npm test` — 52 passed, including the TS mirrors of both.
+- `cd dashboard/web && npm run build` — clean.
+- `cd examples/openai-coding-agent && pytest -q` — 13 passed (see the
+  correction above, found and fixed during this milestone's
+  verification).
+- Guardrail grep: `moreCompleteLines`, `maxShipBytes`,
+  `MAX_OUTPUT_BYTES_CEILING` (per language) each have exactly one
+  definition; `SetOutputPreviewBytes`/`MaxOutputPreviewBytes` have zero
+  (fully removed, not just deprecated).

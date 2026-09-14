@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"time"
 
-	"agentguard/dashboard/store"
+	"github.com/rangasai12/AgentGuard/dashboard/store"
 )
 
 const sessionCookieName = "ag_session"
