@@ -8,8 +8,17 @@ import { MiniStat } from "../components/MiniStat";
 import { Avatar } from "../components/Avatar";
 import { RankList } from "../components/RankList";
 import { AnomalyList } from "../components/AnomalyList";
+import { SlideOver } from "../components/SlideOver";
 import { timeAgo } from "../lib/time";
 import type { Agent, Metrics, ToolCatalogEntry } from "../api/types";
+
+const SORT_OPTIONS: { key: SortKey; label: string }[] = [
+  { key: "name", label: "Name" },
+  { key: "status", label: "Status" },
+  { key: "last_agent_version", label: "Version" },
+  { key: "last_seen_at", label: "Last seen" },
+  { key: "created_at", label: "Registered" },
+];
 
 type SortKey = "name" | "status" | "last_seen_at" | "created_at" | "last_agent_version";
 
@@ -68,20 +77,6 @@ export function AgentsPage() {
     return sorted;
   }, [agents, search, sortKey, sortDir]);
 
-  function toggleSort(key: SortKey) {
-    if (key === sortKey) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    } else {
-      setSortKey(key);
-      setSortDir("asc");
-    }
-  }
-
-  function sortArrow(key: SortKey) {
-    if (key !== sortKey) return null;
-    return <span className="sort-arrow">{sortDir === "asc" ? "▲" : "▼"}</span>;
-  }
-
   async function copyId(id: string) {
     try {
       await navigator.clipboard.writeText(id);
@@ -132,6 +127,25 @@ export function AgentsPage() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
+            <div className="sort-control">
+              <span className="muted">Sort</span>
+              <select value={sortKey} onChange={(e) => setSortKey(e.target.value as SortKey)}>
+                {SORT_OPTIONS.map((o) => (
+                  <option key={o.key} value={o.key}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                className="btn-secondary sort-dir-btn"
+                onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+                aria-label="Toggle sort direction"
+                title={sortDir === "asc" ? "Ascending" : "Descending"}
+              >
+                {sortDir === "asc" ? "↑" : "↓"}
+              </button>
+            </div>
             <span className="muted">
               {visibleAgents.length} of {agents.length} shown
             </span>
@@ -140,98 +154,75 @@ export function AgentsPage() {
           {visibleAgents.length === 0 ? (
             <div className="empty-state">No agents match “{search}”.</div>
           ) : (
-            <div className="split-view">
-              <div className="split-list">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th className="sortable" onClick={() => toggleSort("name")}>
-                        Name {sortArrow("name")}
-                      </th>
-                      <th>Agent ID</th>
-                      <th className="sortable" onClick={() => toggleSort("status")}>
-                        Status {sortArrow("status")}
-                      </th>
-                      <th className="sortable" onClick={() => toggleSort("last_agent_version")}>
-                        Version {sortArrow("last_agent_version")}
-                      </th>
-                      <th>Policy</th>
-                      <th className="sortable" onClick={() => toggleSort("last_seen_at")}>
-                        Last seen {sortArrow("last_seen_at")}
-                      </th>
-                      <th className="sortable" onClick={() => toggleSort("created_at")}>
-                        Registered {sortArrow("created_at")}
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleAgents.map((agent) => (
-                      <tr
-                        key={agent.id}
-                        className={"clickable" + (agent.id === selectedId ? " selected" : "")}
-                        onClick={() => setSelectedId(agent.id === selectedId ? null : agent.id)}
-                      >
-                        <td>
-                          <span className="name-cell">
-                            <Avatar label={agent.name} />
-                            {agent.name}
-                          </span>
-                        </td>
-                        <td>
-                          <button
-                            type="button"
-                            className="id-copy"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              copyId(agent.id);
-                            }}
-                            title={agent.id}
-                          >
-                            <code>{agent.id.slice(0, 14)}…</code>
-                            <span>{copiedId === agent.id ? "Copied" : "Copy"}</span>
-                          </button>
-                        </td>
-                        <td>
-                          <AgentStatusBadge lastSeenAt={agent.last_seen_at} />
-                          {agent.status === "pending" && <span className="muted"> · pending</span>}
-                        </td>
-                        <td className="mono" title={agent.last_agent_version || undefined}>
-                          {agent.last_agent_version ? shortVersion(agent.last_agent_version) : <span className="muted">—</span>}
-                        </td>
-                        <td className="mono" title={agent.last_policy_hash || undefined}>
-                          {agent.last_policy_hash || <span className="muted">—</span>}
-                        </td>
-                        <td
-                          className="muted"
-                          title={agent.last_seen_at ? new Date(agent.last_seen_at).toLocaleString() : undefined}
-                        >
-                          {agent.last_seen_at ? timeAgo(agent.last_seen_at) : "never"}
-                        </td>
-                        <td className="muted" title={new Date(agent.created_at).toLocaleString()}>
-                          {timeAgo(agent.created_at)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              {selectedId && currentTenantId && (
-                <div className="split-detail wide">
-                  {(() => {
-                    const agent = agents.find((a) => a.id === selectedId);
-                    return agent ? (
-                      <AgentDetailPanel
-                        tenantId={currentTenantId}
-                        agent={agent}
-                        isAdmin={isAdmin}
-                        onClose={() => setSelectedId(null)}
-                      />
-                    ) : null;
-                  })()}
-                </div>
-              )}
+            <div className="agent-grid">
+              {visibleAgents.map((agent) => (
+                <button
+                  key={agent.id}
+                  type="button"
+                  className={"agent-card" + (agent.id === selectedId ? " selected" : "")}
+                  onClick={() => setSelectedId(agent.id === selectedId ? null : agent.id)}
+                >
+                  <div className="agent-card-top">
+                    <span className="name-cell">
+                      <Avatar label={agent.name} />
+                      {agent.name}
+                    </span>
+                    <AgentStatusBadge lastSeenAt={agent.last_seen_at} />
+                    {agent.status === "pending" && <span className="muted agent-card-pending">pending</span>}
+                  </div>
+                  <div
+                    className="agent-card-id"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      copyId(agent.id);
+                    }}
+                    title={agent.id}
+                  >
+                    <code>{agent.id.slice(0, 20)}…</code>
+                    <span className="muted">{copiedId === agent.id ? "Copied" : "Copy"}</span>
+                  </div>
+                  <dl className="agent-card-meta">
+                    <div>
+                      <dt>Version</dt>
+                      <dd className="mono" title={agent.last_agent_version || undefined}>
+                        {agent.last_agent_version ? shortVersion(agent.last_agent_version) : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Policy</dt>
+                      <dd className="mono" title={agent.last_policy_hash || undefined}>
+                        {agent.last_policy_hash || "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Last seen</dt>
+                      <dd title={agent.last_seen_at ? new Date(agent.last_seen_at).toLocaleString() : undefined}>
+                        {agent.last_seen_at ? timeAgo(agent.last_seen_at) : "never"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Registered</dt>
+                      <dd title={new Date(agent.created_at).toLocaleString()}>{timeAgo(agent.created_at)}</dd>
+                    </div>
+                  </dl>
+                </button>
+              ))}
             </div>
           )}
+
+          <SlideOver open={!!selectedId} onClose={() => setSelectedId(null)}>
+            {(() => {
+              const agent = agents.find((a) => a.id === selectedId);
+              return agent && currentTenantId ? (
+                <AgentDetailPanel
+                  tenantId={currentTenantId}
+                  agent={agent}
+                  isAdmin={isAdmin}
+                  onClose={() => setSelectedId(null)}
+                />
+              ) : null;
+            })()}
+          </SlideOver>
         </>
       )}
 

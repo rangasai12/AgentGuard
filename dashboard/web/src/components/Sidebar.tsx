@@ -1,4 +1,4 @@
-import { NavLink } from "react-router-dom";
+import { NavLink, useNavigate } from "react-router-dom";
 import { useCallback } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { usePolling } from "../hooks/usePolling";
@@ -24,8 +24,11 @@ const NAV_GROUPS = [
   },
 ];
 
+// Identity (workspace switcher, user, connectivity) lives in the sidebar
+// now, not the topbar — the topbar is just page context (breadcrumb).
 export function Sidebar() {
-  const { currentTenantId } = useAuth();
+  const { user, memberships, currentTenantId, currentMembership, setCurrentTenantId, logout } = useAuth();
+  const navigate = useNavigate();
 
   // Doubles as a real connectivity probe for the footer status line below —
   // this isn't decorative polling, it's the same call the Approvals page
@@ -40,12 +43,41 @@ export function Sidebar() {
     currentTenantId,
   ]);
 
+  async function handleLogout() {
+    await logout();
+    navigate("/login");
+  }
+
+  const initial = user?.email ? user.email[0].toUpperCase() : "?";
+
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">
         <span className="brand-mark" />
         AgentGuard
       </div>
+
+      <div className="sidebar-workspace">
+        <div className="workspace-label">Workspace</div>
+        {memberships.length > 1 ? (
+          <select
+            aria-label="Switch tenant"
+            className="workspace-select"
+            value={currentTenantId ?? ""}
+            onChange={(e) => setCurrentTenantId(e.target.value)}
+          >
+            {memberships.map((m) => (
+              <option key={m.tenant_id} value={m.tenant_id}>
+                {m.tenant_name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <div className="workspace-name">{memberships[0]?.tenant_name ?? "—"}</div>
+        )}
+        {currentMembership && <div className="workspace-role">{currentMembership.role}</div>}
+      </div>
+
       <nav className="sidebar-nav">
         {NAV_GROUPS.map((group) => (
           <div className="sidebar-group" key={group.label}>
@@ -69,9 +101,23 @@ export function Sidebar() {
           </div>
         ))}
       </nav>
+
       <div className="sidebar-footer">
-        <span className={"sidebar-status-dot" + (connectionError ? " down" : "")} />
-        {connectionError ? "Connection issue" : "All systems live"}
+        <div className="sidebar-user">
+          <span className="user-avatar">{initial}</span>
+          <div className="sidebar-user-text">
+            <span className="user-email" title={user?.email}>
+              {user?.email}
+            </span>
+            <span className="connection-status">
+              <span className={"sidebar-status-dot" + (connectionError ? " down" : "")} />
+              {connectionError ? "Connection issue" : "All systems live"}
+            </span>
+          </div>
+        </div>
+        <button type="button" className="btn-link sidebar-logout" onClick={handleLogout}>
+          Log out
+        </button>
       </div>
     </aside>
   );

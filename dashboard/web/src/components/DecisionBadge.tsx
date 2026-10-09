@@ -11,5 +11,10 @@ export function DecisionBadge({ decision }: { decision: string }) {
         : decision === "require_approval"
           ? "badge badge-approval"
           : "badge";
-  return <span className={cls}>{decision}</span>;
+  return (
+    <span className={cls}>
+      <span className="dot" />
+      {decision}
+    </span>
+  );
 }

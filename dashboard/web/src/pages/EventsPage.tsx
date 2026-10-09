@@ -5,6 +5,7 @@ import { usePolling } from "../hooks/usePolling";
 import { DecisionBadge } from "../components/DecisionBadge";
 import { MiniStat } from "../components/MiniStat";
 import { Avatar } from "../components/Avatar";
+import { SlideOver } from "../components/SlideOver";
 import { timeAgo } from "../lib/time";
 import type { Agent, AuditEvent } from "../api/types";
 
@@ -111,18 +112,14 @@ export function EventsPage() {
 
   const events = data?.events ?? [];
 
-  // Keep a selection alive across polling refreshes; fall back to the most
-  // recent event if the previously selected one aged out of the window.
+  // The detail view is a drawer now, opened explicitly by clicking a row —
+  // close it if that row ages out of the current polling window, but don't
+  // force a selection just because nothing is open.
   useEffect(() => {
-    if (events.length === 0) {
+    if (selectedId !== null && !events.some((e) => e.id === selectedId)) {
       setSelectedId(null);
-      return;
     }
-    if (!events.some((e) => e.id === selectedId)) {
-      setSelectedId(events[0].id);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [events]);
+  }, [events, selectedId]);
 
   const selectedEvent = events.find((e) => e.id === selectedId) ?? null;
 
@@ -163,7 +160,7 @@ export function EventsPage() {
         </button>
       </div>
 
-      <div className="filter-bar">
+      <div className="filter-bar slim">
         <label>
           Agent
           <select value={agentId} onChange={(e) => setAgentId(e.target.value)}>
@@ -229,75 +226,70 @@ export function EventsPage() {
             <MiniStat label="Avg. latency" value={summary.avgLatency} suffix="ms" />
           </div>
 
-          <div className="split-view">
-            <div className="split-list">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Timestamp</th>
-                    <th>Agent</th>
-                    <th>Actor</th>
-                    <th>Action type</th>
-                    <th>Resource</th>
-                    <th>Decision</th>
-                    <th>Outcome</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {events.map((event) => (
-                    <tr
-                      key={event.id}
-                      className={"clickable" + (event.id === selectedId ? " selected" : "")}
-                      onClick={() => setSelectedId(event.id)}
-                    >
-                      <td className="muted" title={new Date(event.timestamp).toLocaleString()}>
-                        {timeAgo(event.timestamp)}
-                      </td>
-                      <td>
-                        <span className="name-cell">
-                          <Avatar label={event.agent_name || event.agent_id} size={20} />
-                          {event.agent_name || event.agent_id}
-                        </span>
-                      </td>
-                      <td>
-                        {event.actor ? (
-                          <span className="name-cell">
-                            <Avatar label={event.actor} size={20} />
-                            {event.actor}
-                          </span>
-                        ) : (
-                          "—"
-                        )}
-                      </td>
-                      <td>{event.action_type}</td>
-                      <td className="resource-cell" title={event.resource}>
-                        {event.resource}
-                      </td>
-                      <td>
-                        <DecisionBadge decision={event.decision} />
-                      </td>
-                      <td>
-                        {event.outcome ? (
-                          <span className="name-cell" title={`${event.outcome.exec_ms} ms`}>
-                            <DecisionBadge decision={event.outcome.status} />
-                            <span className="muted">{event.outcome.exec_ms} ms</span>
-                          </span>
-                        ) : (
-                          <span className="muted">—</span>
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Agent</th>
+                <th>Actor</th>
+                <th>Action type</th>
+                <th>Resource</th>
+                <th>Decision</th>
+                <th>Outcome</th>
+              </tr>
+            </thead>
+            <tbody>
+              {events.map((event) => (
+                <tr
+                  key={event.id}
+                  className={"clickable" + (event.id === selectedId ? " selected" : "")}
+                  onClick={() => setSelectedId(event.id)}
+                >
+                  <td className="muted" title={new Date(event.timestamp).toLocaleString()}>
+                    {timeAgo(event.timestamp)}
+                  </td>
+                  <td>
+                    <span className="name-cell">
+                      <Avatar label={event.agent_name || event.agent_id} size={20} />
+                      {event.agent_name || event.agent_id}
+                    </span>
+                  </td>
+                  <td>
+                    {event.actor ? (
+                      <span className="name-cell">
+                        <Avatar label={event.actor} size={20} />
+                        {event.actor}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
+                  </td>
+                  <td>{event.action_type}</td>
+                  <td className="resource-cell" title={event.resource}>
+                    {event.resource}
+                  </td>
+                  <td>
+                    <DecisionBadge decision={event.decision} />
+                  </td>
+                  <td>
+                    {event.outcome ? (
+                      <span className="name-cell" title={`${event.outcome.exec_ms} ms`}>
+                        <DecisionBadge decision={event.outcome.status} />
+                        <span className="muted">{event.outcome.exec_ms} ms</span>
+                      </span>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
 
-            <div className="split-detail">
-              <div className="detail-panel">
-                {!selectedEvent ? (
-                  <div className="detail-placeholder">Select an event to see details.</div>
-                ) : (
-                  <>
+          <SlideOver open={!!selectedEvent} onClose={() => setSelectedId(null)}>
+            <div className="detail-panel">
+              {!selectedEvent ? null : (
+                <>
                     <div className="detail-panel-header">
                       <span className="detail-panel-title">Event Details</span>
                       <button
@@ -471,8 +463,7 @@ export function EventsPage() {
                   </>
                 )}
               </div>
-            </div>
-          </div>
+          </SlideOver>
         </>
       )}
     </div>
