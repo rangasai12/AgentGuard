@@ -2592,6 +2592,66 @@ documented prompt to update the other.
   definition; `SetOutputPreviewBytes`/`MaxOutputPreviewBytes` have zero
   (fully removed, not just deprecated).
 
+## Wrap both `_run` and `_arun` on a LangChain/LangGraph tool, not just `_run`
+
+### Why
+
+Asked whether AgentGuard works for LangGraph agents: mostly yes, since a
+LangGraph tool is a LangChain `BaseTool`/`StructuredTool`, the same shape
+`Guard.wrap_tools` already duck-types on. But `_wrap_one`
+(`sdk-python/agentguard/guard.py`) only ever checked for `._run` — a tool
+defining *only* an async `._arun` (common; LangGraph runs async by
+default) would raise `TypeError` at wrap time, and, worse, a tool
+defining **both** `._run` and `._arun` (a sync fallback plus an async
+override) would only get `._run` wrapped. LangChain's own `ainvoke()`
+calls `_arun` directly when it exists and only runs `_run` in a thread
+when `_arun` is absent — so the second case wasn't a missing feature, it
+was a live enforcement bypass for exactly the async path LangGraph uses.
+
+### What changed
+
+`_wrap_one` now recognizes a tool if it has `.name` and *either* `._run`
+or `._arun` (previously `._run` only). `_wrap_attr` (`guard.py`) changed
+from patching exactly one named attribute to a variadic `*call_attrs`,
+wrapping every one of `_run`/`_arun` the tool actually defines — both
+policy-checked under the same tool name, so the audit trail doesn't care
+which one ran. The existing clone-or-mutate-in-place fallback (for
+pydantic-based tool classes that forbid post-construction attribute
+assignment) is now applied consistently across all wrapped attributes
+together, not per-attribute, so a clone is never left half-patched.
+
+### Guardrail: why new code
+
+- **`_wrap_attr`'s new signature.** Not a second function — the existing
+  one generalized in place; its one other call site (the `.func`/legacy
+  `Tool` case) passes a single-element `call_attrs` and is unaffected.
+- **`_wrap_one`'s new condition.** Extends the existing `._run` check in
+  place; no second duck-typing branch was added alongside it.
+
+### Deferred / known gaps
+
+- TypeScript SDK parity: `sdk-ts/src/guard.ts`'s `wrapOne`/`wrapAttr` only
+  recognize `.func`/`.call`/`.invoke` (LangChain.js's shapes), which don't
+  include a `_run`/`_arun` split at all — LangChain.js tools don't have
+  that split the way the Python library does. Not a gap this fix needed
+  to close; noted so it isn't mistaken for an oversight.
+
+### Verification run at this milestone
+
+- `cd sdk-python && pytest -q` — 68 passed (up from 66), including new
+  `test_wrap_tools_async_only_basetool_style` (a tool with only `_arun`
+  now wraps instead of raising) and
+  `test_wrap_tools_basetool_style_wraps_both_run_and_arun` (a tool
+  defining both is denied through *either* entry point, proving the
+  bypass is closed — asserts the fake daemon saw exactly two evaluate
+  calls, one per attribute).
+- `mypy agentguard` — clean. The first draft built each attribute's
+  action with a lambda capturing `original` via a default argument, which
+  strict mypy can't type ("Cannot infer type of lambda"); replaced with a
+  small typed `action_builder` factory inside `_wrap_attr`.
+- Guardrail grep: `_wrap_attr`, `_wrap_one` each have exactly one
+  definition.
+
 ## Shell command splitting, shadow mode, and a tamper-evident audit log — three cheap fixes found comparing against squidbrake
 
 ### Why

@@ -518,8 +518,15 @@ class Guard:
           - a plain callable with __name__ (a bare function)
           - an object with `.name` (str) and `.func` (callable) — the shape
             of LangChain's legacy `Tool` class
-          - an object with `.name` (str) and `._run` (callable) — the shape
-            of LangChain's `BaseTool`/`StructuredTool` subclasses
+          - an object with `.name` (str) and `._run` and/or `._arun`
+            (callable) — the shape of LangChain's `BaseTool`/`StructuredTool`
+            subclasses (and, since LangGraph's tools *are* LangChain tools,
+            LangGraph agents too). Both are wrapped when both are defined —
+            LangChain calls `_arun` directly when running async (as
+            LangGraph does by default) and only falls back to running
+            `_run` in a thread when `_arun` is absent, so wrapping only
+            `_run` would leave the async path entirely unenforced for any
+            tool that defines both.
 
         Anything else raises TypeError with the supported shapes listed, so
         an unsupported tool type fails loudly at wrap time rather than
@@ -530,33 +537,51 @@ class Guard:
     def _wrap_one(self, tool: Any) -> Any:
         if hasattr(tool, "name") and hasattr(tool, "func") and callable(tool.func):
             return _wrap_attr(self, tool, "name", "func")
-        if hasattr(tool, "name") and hasattr(tool, "_run") and callable(tool._run):
-            return _wrap_attr(self, tool, "name", "_run")
+        if hasattr(tool, "name") and (callable(getattr(tool, "_run", None)) or callable(getattr(tool, "_arun", None))):
+            return _wrap_attr(self, tool, "name", "_run", "_arun")
         if callable(tool) and hasattr(tool, "__name__"):
             return self.tool(tool.__name__)(tool)
         raise TypeError(
             f"agentguard.wrap_tools: don't know how to wrap {tool!r}. "
             "Supported shapes: a plain function, or an object with "
-            "`.name` + `.func` (LangChain Tool) or `.name` + `._run` "
+            "`.name` + `.func` (LangChain Tool) or `.name` + `._run`/`._arun` "
             "(LangChain BaseTool/StructuredTool). See agentguard.adapters "
             "for framework-specific helpers."
         )
 
 
-def _wrap_attr(guard: Guard, tool: Any, name_attr: str, call_attr: str) -> Any:
-    """Returns a shallow copy of tool with call_attr replaced by a
-    policy-checked wrapper, preserving every other attribute (so LangChain's
-    own introspection of the tool — description, args_schema, etc. — still
-    works unchanged).
+def _wrap_attr(guard: Guard, tool: Any, name_attr: str, *call_attrs: str) -> Any:
+    """Returns a shallow copy of tool with each name in call_attrs that
+    tool actually defines replaced by its own policy-checked wrapper (all
+    sharing one tool name, so the audit trail doesn't care which one ran),
+    preserving every other attribute — so LangChain's own introspection of
+    the tool (description, args_schema, etc.) still works unchanged.
+
+    Wrapping is all-or-nothing across call_attrs: if any of them can't be
+    set on a clone (see the TypeError handling below), every one of them
+    is set on the original tool instead, rather than a clone with some
+    attributes patched and others not.
     """
     tool_name = getattr(tool, name_attr)
-    original = getattr(tool, call_attr)
-    guard._remember_tool(tool_name, original, getattr(tool, "description", None))
-    wrapped = guard._wrap_callable(tool_name, original, lambda a, k: guard._tool_action(tool_name, _bind_args(original, a, k)))
+    present = [(attr, getattr(tool, attr)) for attr in call_attrs if callable(getattr(tool, attr, None))]
+    if not present:
+        raise TypeError(f"agentguard: expected at least one of {call_attrs!r} on {tool!r}")
+    guard._remember_tool(tool_name, present[0][1], getattr(tool, "description", None))
+
+    def action_builder(original: Callable[..., Any]) -> Callable[[tuple, dict], Dict[str, Any]]:
+        # A factory, not a lambda in the loop, so each attribute binds its
+        # own `original`.
+        return lambda a, k: guard._tool_action(tool_name, _bind_args(original, a, k))
+
+    wrapped_by_attr = {
+        attr: guard._wrap_callable(tool_name, original, action_builder(original))
+        for attr, original in present
+    }
 
     try:
         clone = _copy_object(tool)
-        setattr(clone, call_attr, wrapped)
+        for attr, wrapped in wrapped_by_attr.items():
+            setattr(clone, attr, wrapped)
         return clone
     except TypeError:
         # Some frameworks' tool classes (e.g. pydantic-based BaseModel
@@ -564,7 +589,8 @@ def _wrap_attr(guard: Guard, tool: Any, name_attr: str, call_attr: str) -> Any:
         # Falling back to mutating in place is the pragmatic v0.1 choice —
         # revisit with a framework-specific adapter if this proves too
         # narrow for a real integration.
-        setattr(tool, call_attr, wrapped)
+        for attr, wrapped in wrapped_by_attr.items():
+            setattr(tool, attr, wrapped)
         return tool
 
 

@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import pytest
@@ -334,11 +335,16 @@ def test_wrap_tools_langchain_style_denied(fake_daemon):
 
 
 class FakeBaseTool:
-    """Duck-types LangChain's BaseTool/StructuredTool shape (._run)."""
+    """Duck-types LangChain's BaseTool/StructuredTool shape (._run and,
+    optionally, ._arun — the async override LangGraph's default async
+    execution calls directly when present)."""
 
-    def __init__(self, name, run_fn):
+    def __init__(self, name, run_fn=None, arun_fn=None):
         self.name = name
-        self._run = run_fn
+        if run_fn is not None:
+            self._run = run_fn
+        if arun_fn is not None:
+            self._arun = arun_fn
 
 
 def test_wrap_tools_basetool_style(fake_daemon):
@@ -346,6 +352,48 @@ def test_wrap_tools_basetool_style(fake_daemon):
     tool = FakeBaseTool(name="lookup", run_fn=lambda q: f"found {q}")
     wrapped = guard.wrap_tools([tool])[0]
     assert wrapped._run("thing") == "found thing"
+
+
+def test_wrap_tools_async_only_basetool_style(fake_daemon):
+    # LangGraph tools are frequently async-only (no sync `_run` at all).
+    guard = make_guard(fake_daemon, {"lookup": {"result": "allow"}})
+
+    async def arun(q):
+        return f"found {q}"
+
+    tool = FakeBaseTool(name="lookup", arun_fn=arun)
+    wrapped = guard.wrap_tools([tool])[0]
+    assert asyncio.run(wrapped._arun("thing")) == "found thing"
+
+
+def test_wrap_tools_basetool_style_wraps_both_run_and_arun(fake_daemon):
+    # The real gap this closes: a tool defining BOTH _run and _arun (a
+    # sync fallback plus an async override) must have both enforced —
+    # LangChain/LangGraph call _arun directly when running async and
+    # never touch _run in that case, so wrapping only _run would leave
+    # the async path completely unenforced.
+    seen = []
+
+    def handler(req):
+        if req.get("cmd") == "ping":
+            return {"ok": True}
+        seen.append(req.get("action", {}).get("tool"))
+        return {"ok": True, "decision": {"result": "deny"}}
+
+    d = fake_daemon(handler)
+    guard = Guard(policy="unused.yaml", client=DaemonClient(d.socket_path))
+
+    async def arun(q):
+        return f"async found {q}"
+
+    tool = FakeBaseTool(name="lookup", run_fn=lambda q: f"sync found {q}", arun_fn=arun)
+    wrapped = guard.wrap_tools([tool])[0]
+
+    with pytest.raises(PolicyDenied):
+        wrapped._run("thing")
+    with pytest.raises(PolicyDenied):
+        asyncio.run(wrapped._arun("thing"))
+    assert seen == ["lookup", "lookup"], "expected both _run and _arun to be policy-checked"
 
 
 def test_wrap_tools_unsupported_shape_raises_type_error(fake_daemon):

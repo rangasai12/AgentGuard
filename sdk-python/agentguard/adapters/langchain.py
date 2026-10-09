@@ -1,8 +1,10 @@
 """Explicit LangChain entry point. This has no import-time dependency on
-langchain itself — it duck-types on the same `.name`/`.func`/`._run` shapes
-Guard.wrap_tools already handles generically. Prefer `guard.wrap_tools(tools)`
-directly; this module exists so LangChain users can find the integration by
-name and see it documented against the library they're using.
+langchain itself — it duck-types on the same `.name`/`.func`/`._run`/`._arun`
+shapes Guard.wrap_tools already handles generically (which also covers
+LangGraph, since a LangGraph tool is a LangChain tool). Prefer
+`guard.wrap_tools(tools)` directly; this module exists so LangChain/
+LangGraph users can find the integration by name and see it documented
+against the library they're using.
 """
 from __future__ import annotations
 
