@@ -213,3 +213,41 @@ func TestDaemonSetPolicyTakesEffectImmediately(t *testing.T) {
 		t.Fatalf("expected updated policy to allow, got %s", after.Decision.Result)
 	}
 }
+
+func TestShadowModeAllowsButRecordsWhatWouldHaveHappened(t *testing.T) {
+	policy, err := engine.ParsePolicy([]byte("mode: shadow\n" + daemonTestPolicy))
+	if err != nil {
+		t.Fatalf("ParsePolicy: %v", err)
+	}
+	audit := newTestAuditLogger(t)
+	d := New(policy, audit)
+
+	// Would be denied: runs, recorded as would-deny.
+	res := d.Evaluate(DecisionRequest{Action: engine.Action{Type: engine.ActionFSWrite, Path: "/etc/passwd"}})
+	if res.Decision.Result != engine.Allow {
+		t.Fatalf("shadow mode must not deny, got %+v", res.Decision)
+	}
+	// Would need approval: runs immediately, nobody is asked.
+	start := time.Now()
+	res = d.Evaluate(DecisionRequest{Action: engine.Action{Type: engine.ActionShell, Command: "rm -rf /tmp/x"}})
+	if res.Decision.Result != engine.Allow || res.ApprovalID != "" || time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("shadow mode must not wait for approval, got %+v after %s", res, time.Since(start))
+	}
+	// Allowed anyway: no shadow decision.
+	d.Evaluate(DecisionRequest{Action: engine.Action{Type: engine.ActionFSWrite, Path: "/workspace/a.go"}})
+
+	events := audit.Tail(3)
+	want := []engine.Result{engine.Deny, engine.RequireApproval, ""}
+	for i, ev := range events {
+		if ev.Decision != engine.Allow || ev.ShadowDecision != want[i] {
+			t.Errorf("event %d: decision %s shadow %q, want allow / %q", i, ev.Decision, ev.ShadowDecision, want[i])
+		}
+	}
+	if events[0].MatchedRule == "" {
+		t.Errorf("the rule that would have denied should still be named, got %+v", events[0])
+	}
+
+	if _, err := engine.ParsePolicy([]byte("mode: audit\n" + daemonTestPolicy)); err == nil {
+		t.Errorf("an unknown mode must be rejected")
+	}
+}

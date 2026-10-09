@@ -83,6 +83,9 @@ second tenant-settings table or page, a second tool table, a second metrics/aggr
 | Daemon identity over ping (policy content hash, distinct from the path-hash above) | `Response.PolicyHash`/`PolicyPath` (`daemon/socket_api.go`), checked against `policy_content_hash`/`policyContentHash` (Python/TS `client.py`/`client.ts`) by `Guard._ensure_daemon`/`ensureDaemon` |
 | Refuse to clobber a live daemon | `daemon.checkNoLiveDaemon`, called from `Serve` unless `force` |
 | Network proxy listen address default | `cli.DefaultProxyAddr` (`cli/paths.go`) |
+| Shell command splitting (every command a line runs, for shell rules) | `parseShellCommands` (`engine/shell.go`), called only by `evaluateShell` |
+| Shadow mode (evaluate + audit, never block) | `Policy.Shadow` (`engine/policy.go`), applied only inside `daemon.Decide`; recorded as `AuditEvent.ShadowDecision` |
+| Audit log hash chain + verification | `AuditLogger.appendLine` / `chainLine` / `VerifyAuditLog` (`daemon/audit.go`), surfaced by `agentctl audit verify` |
 | Runtime action validation (required fields per action type) | `Action.Validate` (`engine/types.go`), called first thing inside `Evaluate`; mirrored client-side (Python only) by `_validate_action_fields` + `_REQUIRED_ACTION_FIELDS` (`sdk-python/agentguard/guard.py`) |
 | Signup → create-agent → register CLI flow | `agentctl cloud signup` / `agentctl cloud agents create` (`cli/cloud_cmd.go`); the exact REST contract they drive is `docs/api-reference.md` |
 | Cloud API request/response contract (signup, create agent, register) | `docs/api-reference.md` |

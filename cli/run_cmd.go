@@ -39,6 +39,13 @@ func runRunCmd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	if policy.Shadow() {
+		// The sandbox enforces at the OS level and records nothing, so it
+		// can't "only record what it would have done".
+		fmt.Fprintln(stderr, "agentctl run: policy has mode: shadow, but hardened mode always enforces and records nothing; set mode: enforce to use it")
+		return 1
+	}
+
 	if policy.HasNetworkRules() && *proxyAddr == "" {
 		fmt.Fprintln(stderr, "agentctl run: warning: policy configures network rules but no --proxy-addr was given — all network access will be denied for this process")
 	}

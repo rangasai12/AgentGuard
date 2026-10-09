@@ -36,6 +36,15 @@ properties:
   name:
     type: string
     description: Human-readable policy name, shown in audit logs and CLI output.
+  mode:
+    enum: [enforce, shadow]
+    default: enforce
+    description: >
+      shadow: every action is evaluated and audited, but nothing is denied or held for
+      approval — the audit event records decision "allow" plus `shadow_decision` (what
+      enforcement would have done). For trying a policy on real traffic before enforcing
+      it. `agentctl policy test` always tests enforcement; hardened mode (`agentctl run`)
+      refuses a shadow policy.
 
   filesystem:
     type: array
@@ -102,7 +111,16 @@ properties:
           additionalProperties: false
           required: [pattern]
           properties:
-            pattern: { type: string, description: "glob over the full command string; * matches any sequence" }
+            pattern:
+              type: string
+              description: >
+                glob; * matches any sequence. A command line is split into every command
+                it runs (across ; && || | & newlines and ( ), inside $(...), backticks and
+                <(...), and through `sh -c` / `eval`). Allow patterns must cover EACH
+                command on its own — "git *" no longer approves "git status && curl ...".
+                Deny patterns match the whole line or any command in it, including with
+                wrappers (sudo, env, xargs, nohup, ...), quotes and the program's directory
+                stripped. A line that can't be split (unclosed quote) is denied.
             require_approval: { type: boolean }
             reason: { type: string }
       deny:

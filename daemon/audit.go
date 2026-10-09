@@ -2,12 +2,15 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -69,15 +72,20 @@ const (
 // reported back — its Outcome. Old log lines lacking these fields
 // unmarshal with them empty/nil.
 type AuditEvent struct {
-	Timestamp   time.Time         `json:"timestamp"`
-	Actor       string            `json:"actor,omitempty"`
-	ActionType  engine.ActionType `json:"action_type"`
-	Resource    string            `json:"resource"`
-	Decision    engine.Result     `json:"decision"`
-	MatchedRule string            `json:"matched_rule"`
-	Reason      string            `json:"reason,omitempty"`
-	ApprovalID  string            `json:"approval_id,omitempty"`
-	LatencyMS   int64             `json:"latency_ms"` // policy evaluation plus any approval wait — not tool execution (see Outcome.ExecMS)
+	Timestamp  time.Time         `json:"timestamp"`
+	Actor      string            `json:"actor,omitempty"`
+	ActionType engine.ActionType `json:"action_type"`
+	Resource   string            `json:"resource"`
+	Decision   engine.Result     `json:"decision"`
+	// ShadowDecision is set only under policy `mode: shadow`, when the
+	// policy would have denied or held the action but let it through:
+	// Decision records what happened (allow), this records what enforcement
+	// would have done.
+	ShadowDecision engine.Result `json:"shadow_decision,omitempty"`
+	MatchedRule    string        `json:"matched_rule"`
+	Reason         string        `json:"reason,omitempty"`
+	ApprovalID     string        `json:"approval_id,omitempty"`
+	LatencyMS      int64         `json:"latency_ms"` // policy evaluation plus any approval wait — not tool execution (see Outcome.ExecMS)
 
 	EventID      string         `json:"event_id,omitempty"`
 	Kind         string         `json:"kind,omitempty"` // "" for a decision, KindOutcome for a patch line
@@ -99,11 +107,14 @@ type AuditFilter struct {
 }
 
 // AuditLogger appends events to a JSONL file and keeps a bounded recent-events
-// ring buffer in memory. Safe for concurrent use.
+// ring buffer in memory. Safe for concurrent use, including by several
+// processes appending to the same file (the daemon, `agentctl proxy` and
+// `agentctl mcp-proxy` all default to the same policy-scoped log): every
+// line is written under an exclusive flock, and is hash-chained to the line
+// before it (see appendLine and VerifyAuditLog).
 type AuditLogger struct {
 	mu        sync.Mutex
 	file      *os.File
-	writer    *bufio.Writer
 	recent    []AuditEvent
 	maxRecent int
 }
@@ -112,11 +123,12 @@ const defaultMaxRecent = 2000
 
 // NewAuditLogger opens (creating if necessary) the JSONL audit log at path.
 func NewAuditLogger(path string) (*AuditLogger, error) {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	// Read access too: appendLine reads the last line to chain onto it.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("opening audit log %s: %w", path, err)
 	}
-	return &AuditLogger{file: f, writer: bufio.NewWriter(f), maxRecent: defaultMaxRecent}, nil
+	return &AuditLogger{file: f, maxRecent: defaultMaxRecent}, nil
 }
 
 // Log appends ev to the audit log and the in-memory ring.
@@ -177,22 +189,176 @@ func (l *AuditLogger) Report(eventID string, o Outcome) error {
 	return l.appendLine(patch)
 }
 
-// appendLine writes one JSON line and flushes. Caller holds l.mu.
+// appendLine writes one JSON line, chained to the file's current last line.
+// Caller holds l.mu; the flock additionally serializes against other
+// processes appending to the same file, so the "last line" read here is
+// still the last line when this one is written.
 func (l *AuditLogger) appendLine(ev AuditEvent) error {
-	data, err := json.Marshal(ev)
+	body, err := json.Marshal(ev)
 	if err != nil {
 		return fmt.Errorf("marshaling audit event: %w", err)
 	}
-	if _, err := l.writer.Write(data); err != nil {
+	fd := int(l.file.Fd())
+	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("locking audit log: %w", err)
+	}
+	defer syscall.Flock(fd, syscall.LOCK_UN) //nolint:errcheck // closing the fd releases it anyway
+
+	last, err := readLastLine(l.file)
+	if err != nil {
+		return fmt.Errorf("reading audit log tail: %w", err)
+	}
+	var line []byte
+	if len(last) > 0 && last[len(last)-1] != '\n' {
+		// A torn write left a partial line; don't glue this event onto it.
+		// VerifyAuditLog will (rightly) report that partial line.
+		line = append(line, '\n')
+	}
+	line = append(line, chainLine(body, chainLink(bytes.TrimSuffix(last, []byte("\n"))))...)
+	line = append(line, '\n')
+	if _, err := l.file.Write(line); err != nil {
 		return fmt.Errorf("writing audit event: %w", err)
 	}
-	if err := l.writer.WriteByte('\n'); err != nil {
-		return err
-	}
-	if err := l.writer.Flush(); err != nil {
-		return fmt.Errorf("flushing audit log: %w", err)
-	}
 	return nil
+}
+
+// The audit log is a hash chain: each line ends in a "chain" field holding
+// sha256(<previous line's link> + "\n" + <this line without the chain
+// field>). A line's link is its chain value, or — for a line written before
+// chaining existed — the sha256 of its bytes, so a log that predates chaining
+// keeps working and its first chained line anchors to the old tail. Editing,
+// inserting or deleting any line breaks every chain value after it (see
+// VerifyAuditLog). Hashing the exact bytes written, rather than a
+// re-marshaled event, keeps verification independent of JSON encoding
+// details. The chain field is appended textually and never parsed into
+// AuditEvent; readers that unmarshal lines ignore it.
+const chainPrefix = `,"chain":"`
+
+// chainLine returns body (a JSON object) with its chain field appended.
+func chainLine(body []byte, prevLink string) []byte {
+	sum := sha256.Sum256([]byte(prevLink + "\n" + string(body)))
+	out := make([]byte, 0, len(body)+len(chainPrefix)+66)
+	out = append(out, body[:len(body)-1]...)
+	out = append(out, chainPrefix...)
+	out = append(out, hex.EncodeToString(sum[:])...)
+	return append(out, '"', '}')
+}
+
+// splitChain separates a line into its body and chain value; ok is false
+// for a line with no chain field.
+func splitChain(line []byte) (body []byte, chain string, ok bool) {
+	const tail = 64 + 2 // hex digest + `"}`
+	n := len(line) - tail - len(chainPrefix)
+	if n < 1 || string(line[n:n+len(chainPrefix)]) != chainPrefix || line[len(line)-2] != '"' || line[len(line)-1] != '}' {
+		return nil, "", false
+	}
+	chain = string(line[n+len(chainPrefix) : len(line)-2])
+	if !isHexID(chain[:32]) || !isHexID(chain[32:]) {
+		return nil, "", false
+	}
+	body = append(append([]byte(nil), line[:n]...), '}')
+	return body, chain, true
+}
+
+// chainLink is what the next line chains onto: line's chain value, or the
+// hash of the whole line if it has none ("" for an empty log).
+func chainLink(line []byte) string {
+	if len(line) == 0 {
+		return ""
+	}
+	if _, chain, ok := splitChain(line); ok {
+		return chain
+	}
+	sum := sha256.Sum256(line)
+	return hex.EncodeToString(sum[:])
+}
+
+// readLastLine returns the file's last line including its trailing newline
+// (if any), reading backwards from the end in chunks.
+func readLastLine(f *os.File) ([]byte, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	end := info.Size()
+	const chunk = 64 << 10
+	var buf []byte
+	for pos := end; pos > 0; {
+		n := int64(chunk)
+		if pos < n {
+			n = pos
+		}
+		pos -= n
+		part := make([]byte, n)
+		if _, err := f.ReadAt(part, pos); err != nil {
+			return nil, err
+		}
+		buf = append(part, buf...)
+		// Ignore the line's own trailing newline when looking for its start.
+		search := buf
+		if int64(len(buf)) == end-pos && len(search) > 0 && search[len(search)-1] == '\n' {
+			search = search[:len(search)-1]
+		}
+		if i := bytes.LastIndexByte(search, '\n'); i >= 0 {
+			return buf[i+1:], nil
+		}
+	}
+	return buf, nil
+}
+
+// AuditVerifyReport is the result of VerifyAuditLog.
+type AuditVerifyReport struct {
+	Lines     int    // total lines read
+	Unchained int    // lines written before chaining existed (not tamper-evident)
+	Head      string // the last line's link — record it elsewhere to detect truncation later
+	// BrokenAt is the 1-based line number where the chain first fails to
+	// verify (0 when intact), with Problem saying why.
+	BrokenAt int
+	Problem  string
+}
+
+// VerifyAuditLog checks an audit log's hash chain from the first line. It
+// detects any edited, inserted, deleted or reordered line, except that
+// lines removed from the very end leave a shorter chain that still
+// verifies — compare Head against a value recorded earlier to catch that.
+// Unchained lines are accepted only before the first chained one.
+func VerifyAuditLog(r io.Reader) (AuditVerifyReport, error) {
+	var rep AuditVerifyReport
+	br := bufio.NewReaderSize(r, 64<<10)
+	prev, chained := "", false
+	for {
+		line, err := br.ReadBytes('\n')
+		if len(line) > 0 {
+			rep.Lines++
+			if line[len(line)-1] != '\n' {
+				rep.BrokenAt, rep.Problem = rep.Lines, "last line is incomplete (a torn write)"
+				return rep, nil
+			}
+			line = line[:len(line)-1]
+			body, _, ok := splitChain(line)
+			switch {
+			case ok:
+				if want := chainLine(body, prev); !bytes.Equal(want, line) {
+					rep.BrokenAt, rep.Problem = rep.Lines, "chain hash does not match: this line or one before it was changed, inserted or removed"
+					return rep, nil
+				}
+				chained = true
+			case chained:
+				rep.BrokenAt, rep.Problem = rep.Lines, "line has no chain field after chaining began"
+				return rep, nil
+			default:
+				rep.Unchained++
+			}
+			prev = chainLink(line)
+			rep.Head = prev
+		}
+		if err == io.EOF {
+			return rep, nil
+		}
+		if err != nil {
+			return rep, err
+		}
+	}
 }
 
 // Tail returns the n most recent events, oldest first.
@@ -248,9 +414,6 @@ func (l *AuditLogger) Query(filter AuditFilter) []AuditEvent {
 func (l *AuditLogger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if err := l.writer.Flush(); err != nil {
-		return err
-	}
 	return l.file.Close()
 }
 

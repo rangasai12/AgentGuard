@@ -159,6 +159,7 @@ type AuditPolicy struct {
 type Policy struct {
 	Version    int              `yaml:"version"`
 	Name       string           `yaml:"name,omitempty"`
+	Mode       string           `yaml:"mode,omitempty"` // "enforce" (default) | "shadow" — see Shadow
 	Filesystem []FSRule         `yaml:"filesystem,omitempty"`
 	Network    NetworkPolicy    `yaml:"network,omitempty"`
 	Shell      ShellPolicy      `yaml:"shell,omitempty"`
@@ -182,6 +183,16 @@ type Policy struct {
 // access at the OS level at all, not just what to allow.
 func (p *Policy) HasNetworkRules() bool {
 	return p.Network.Default != "" || len(p.Network.Allow) > 0 || len(p.Network.Deny) > 0
+}
+
+// Shadow reports whether the policy runs in shadow mode: every action is
+// evaluated and audited with the decision the policy *would* have made, but
+// nothing is denied or held for approval. It lets a team watch a new policy
+// against real traffic before enforcing it. Applied only inside
+// daemon.Decide — Evaluate itself is unaware of it, so `agentctl policy
+// test` always tests what enforcement would do.
+func (p *Policy) Shadow() bool {
+	return p.Mode == "shadow"
 }
 
 // ApprovalTimeoutSeconds returns the configured timeout, defaulting to 300s.
@@ -230,6 +241,9 @@ func LoadPolicy(path string) (*Policy, error) {
 func (p *Policy) Validate() error {
 	if p.Version != 1 {
 		return fmt.Errorf("unsupported policy version %d (expected 1)", p.Version)
+	}
+	if p.Mode != "" && p.Mode != "enforce" && p.Mode != "shadow" {
+		return fmt.Errorf("mode: invalid value %q (expected enforce or shadow)", p.Mode)
 	}
 	for i, r := range p.Filesystem {
 		if (r.Allow == "") == (r.Deny == "") {
